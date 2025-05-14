@@ -25,7 +25,7 @@ app.use((req, res, next) => {
 });
 
 const mongoUrl =
-  "mongodb+srv://krushant:kK58jbHcl5taHmNb@transactions-cluster.bkfz4.mongodb.net/?retryWrites=true&w=majority&appName=transactions-cluster";
+  process.env.MONGO_URL;
 const dbName = "transactionsDB";
 
 const upload = multer({
