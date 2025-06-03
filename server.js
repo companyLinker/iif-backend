@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import { MongoClient, ObjectId } from "mongodb";
 import csv from "csv-parser";
-import fs from "fs";
+import fs from "fs/promises";
 import XLSX from "xlsx";
 import moment from "moment";
 
@@ -25,7 +25,7 @@ app.use((req, res, next) => {
 });
 
 const mongoUrl =
-  process.env.MONGO_URL;
+  "mongodb+srv://krushant:kK58jbHcl5taHmNb@transactions-cluster.bkfz4.mongodb.net/?retryWrites=true&w=majority&appName=transactions-cluster";
 const dbName = "transactionsDB";
 
 const upload = multer({
@@ -55,17 +55,22 @@ async function connectToMongoDB() {
     });
     db = client.db(dbName);
     console.log("Connected to MongoDB");
-    await db.collection("CTData").createIndex({ Date: 1 }); // Index for CTData
-    await db.collection("BMData").createIndex({ store_name: 1 }); // Index for BMData
+    await db.collection("DataSummary").createIndex({ Date: 1 });
+    await db.collection("DataSummary").createIndex({ StoreName: 1, Date: 1 });
+    await db.collection("BMData").createIndex({ store_name: 1 });
+    await db.collection("Formats").createIndex({ name: 1 }, { unique: true });
     return client;
   } catch (err) {
-    console.error("Error connecting to MongoDB:", err);
+    console.error("Error connecting to MongoDB:", {
+      message: err.message,
+      stack: err.stack,
+    });
     throw err;
   }
 }
 
-// Clean column names and values for CTData (original working version)
-function cleanObjectForCTData(obj) {
+// Clean column names and values for DataSummary
+function cleanObjectForDataSummary(obj) {
   console.log("Processing columns and sample values:", {
     columns: Object.keys(obj),
     sample: obj,
@@ -80,10 +85,6 @@ function cleanObjectForCTData(obj) {
         const parsedNumber = parseFloat(value.replace(/[^0-9.-]/g, ""));
         if (!isNaN(parsedNumber) && value.match(/^-?\d*\.?\d*$/)) {
           value = parsedNumber;
-        } else if (value) {
-          console.warn(
-            `Non-numeric string value "${value}" for column "${cleanKey}"`
-          );
         }
       }
     } else if (value === null || value === undefined) {
@@ -115,7 +116,7 @@ function cleanObjectForCTData(obj) {
           value = parsedDate.format("MM-DD-YYYY");
         } else {
           console.log(`Failed to parse date: "${value}"`);
-          value = "Invalid Date";
+          value = null;
         }
       }
     }
@@ -125,7 +126,7 @@ function cleanObjectForCTData(obj) {
   }, {});
 }
 
-// Clean column names and values for BMData (preserves _id for updates)
+// Clean column names and values for BMData
 function cleanObjectForBMData(obj) {
   const cleaned = Object.keys(obj).reduce((acc, key) => {
     const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
@@ -136,7 +137,6 @@ function cleanObjectForBMData(obj) {
     } else if (value instanceof Date) {
       value = moment(value).format("MM-DD-YYYY");
     } else if (typeof value === "number" && !isNaN(value)) {
-      // Handle Excel serial dates
       const date = new Date((value - 25569) * 86400 * 1000);
       value = moment(date).format("MM-DD-YYYY");
     }
@@ -145,30 +145,14 @@ function cleanObjectForBMData(obj) {
     return acc;
   }, {});
 
-  delete cleaned._id; // Remove _id for new inserts, letting MongoDB generate it
+  delete cleaned._id;
   return cleaned;
 }
 
 connectToMongoDB()
   .then((client) => {
     mongoClient = client;
-    const upload = multer({
-      dest: "./Uploads/",
-      fileFilter: (req, file, cb) => {
-        const allowedTypes = [
-          "text/csv",
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          "application/vnd.ms-excel",
-        ];
-        if (allowedTypes.includes(file.mimetype)) {
-          cb(null, true);
-        } else {
-          cb(new Error("Only CSV, XLSX, and XLS files are allowed"));
-        }
-      },
-    });
 
-    // Filter options endpoint for homepage interactive filtering
     app.get("/api/filter-options", async (req, res) => {
       try {
         if (!db) {
@@ -176,10 +160,7 @@ connectToMongoDB()
           if (!db) throw new Error("Failed to connect to MongoDB");
         }
 
-        // Extract query parameters for state and brand
         const { state, brand } = req.query;
-
-        // Build match query for store mappings
         const matchQuery = {};
         if (state) {
           matchQuery.State = Array.isArray(state) ? { $in: state } : state;
@@ -188,17 +169,14 @@ connectToMongoDB()
           matchQuery.BRAND = Array.isArray(brand) ? { $in: brand } : brand;
         }
 
-        // Fetch distinct states (not filtered by selections)
         const states = await db
           .collection("BMData")
           .distinct("State", { State: { $ne: null } });
 
-        // Fetch distinct brands (not filtered by selections)
         const brands = await db
           .collection("BMData")
           .distinct("BRAND", { BRAND: { $ne: null } });
 
-        // Fetch store mappings filtered by state and/or brand
         const storeMappings = await db
           .collection("BMData")
           .find(
@@ -211,6 +189,7 @@ connectToMongoDB()
                 POS_COMPANY_NAME: 1,
                 State: 1,
                 BRAND: 1,
+                mapped_col_name: 1,
                 _id: 0,
               },
             }
@@ -235,86 +214,408 @@ connectToMongoDB()
       }
     });
 
-    // Upload endpoint for CTData
-    app.post("/api/upload", upload.single("file"), async (req, res) => {
+    app.get("/api/formats", async (req, res) => {
       try {
-        if (!req.file) {
-          return res.status(400).send({ message: "No file uploaded" });
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("Failed to connect to MongoDB");
         }
 
-        const file = req.file; // Handle single file (since frontend sends one at a time)
-        const filePath = file.path;
-        const fileExtension = file.originalname.split(".").pop().toLowerCase();
-        let data = [];
-        let sheetCount = 1; // Default for CSV
-
-        if (fileExtension === "csv") {
-          await new Promise((resolve, reject) => {
-            fs.createReadStream(filePath)
-              .pipe(csv())
-              .on("data", (row) => {
-                const cleanedRow = cleanObjectForCTData(row);
-                if (Object.keys(cleanedRow).length > 0) {
-                  // Ensure row has data
-                  data.push(cleanedRow);
-                }
-              })
-              .on("end", resolve)
-              .on("error", reject);
-          });
-        } else if (fileExtension === "xlsx" || fileExtension === "xls") {
-          const workbook = XLSX.readFile(filePath);
-          const sheetNames = workbook.SheetNames;
-          sheetCount = sheetNames.length;
-
-          for (const sheetName of sheetNames) {
-            const sheet = workbook.Sheets[sheetName];
-            const rawData = XLSX.utils.sheet_to_json(sheet, { defval: null }); // Handle empty cells
-            const sheetData = rawData
-              .map(cleanObjectForCTData)
-              .filter((row) => Object.keys(row).length > 0); // Filter out empty rows
-            console.log(
-              `Processed sheet: ${sheetName}, Rows: ${sheetData.length}`
-            );
-            data = data.concat(sheetData); // Combine data from all sheets
-          }
-        } else {
-          return res.status(400).send({ message: "Invalid file format" });
-        }
-
-        if (data.length === 0) {
-          console.warn("No data processed from file:", filePath);
-          return res
-            .status(400)
-            .send({ message: "No valid data found in file" });
-        }
-
-        console.log(
-          "Sample processed CTData from all sheets:",
-          data.slice(0, 2)
+        const formats = await db.collection("Formats").find({}).toArray();
+        console.log(`Retrieved ${formats.length} formats`);
+        res.status(200).send(
+          formats.map((format) => ({
+            ...format,
+            _id: format._id.toString(),
+          }))
         );
-        const result = await db.collection("CTData").insertMany(data);
-        console.log(
-          "Insert result for CTData:",
-          result.insertedCount,
-          "documents"
-        );
+      } catch (err) {
+        console.error("Error retrieving formats:", err.message);
+        res
+          .status(500)
+          .send({ message: "Error retrieving formats", error: err.message });
+      }
+    });
 
-        fs.unlinkSync(filePath);
-        res.send({
-          message: "Data uploaded successfully",
-          insertedCount: result.insertedCount,
-          sheetCount: sheetCount,
+    app.post("/api/formats", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("Failed to connect to MongoDB");
+        }
+
+        const formatData = req.body;
+        if (!formatData.name) {
+          return res.status(400).send({ message: "Format name is required" });
+        }
+
+        console.log("Received format data:", {
+          name: formatData.name,
+          fields: Object.keys(formatData),
         });
+
+        const validFields = [
+          "name",
+          "keyMappings",
+          "valueMappings",
+          "selectedColumns",
+          "nonZeroColumns",
+          "positionMappings",
+          "calculationType",
+          "calculatedColumnTypes",
+          "calculatedColumnIsCustomString",
+          "calculatedColumnNames",
+          "emptyColumnNames",
+          "coaTargetIifColumn",
+          "bankTargetIifColumn",
+          "storeSplitIifColumn",
+          "memoMappingType",
+          "selectedStates",
+          "selectedBrands",
+          "selectedStoreNames",
+          "normalizedColumnMap",
+          "calculatedColumns",
+        ];
+
+        const cleanedFormat = Object.keys(formatData).reduce((acc, key) => {
+          if (validFields.includes(key)) {
+            acc[key] = formatData[key];
+          }
+          return acc;
+        }, {});
+
+        // Validate calculatedColumns
+        if (cleanedFormat.calculatedColumns) {
+          if (!Array.isArray(cleanedFormat.calculatedColumns)) {
+            return res
+              .status(400)
+              .send({ message: "calculatedColumns must be an array" });
+          }
+          cleanedFormat.calculatedColumns = cleanedFormat.calculatedColumns.map(
+            (col) => ({
+              name: typeof col.name === "string" ? col.name : "",
+              formula: typeof col.formula === "string" ? col.formula : "",
+              selectedColumns: Array.isArray(col.selectedColumns)
+                ? col.selectedColumns
+                : [], // Validate selectedColumns
+              calculationType:
+                typeof col.calculationType === "string" &&
+                ["Formula", "Answer"].includes(col.calculationType)
+                  ? col.calculationType
+                  : "Answer",
+            })
+          );
+        } else {
+          cleanedFormat.calculatedColumns = [];
+        }
+
+        if (!Array.isArray(cleanedFormat.emptyColumnNames)) {
+          cleanedFormat.emptyColumnNames = [];
+        }
+
+        try {
+          const result = await db
+            .collection("Formats")
+            .insertOne(cleanedFormat);
+          console.log(
+            `Created format: ${cleanedFormat.name}, ID: ${result.insertedId}`
+          );
+
+          const createdFormat = await db
+            .collection("Formats")
+            .findOne({ _id: result.insertedId });
+          res.status(201).send({
+            ...createdFormat,
+            _id: createdFormat._id.toString(),
+          });
+        } catch (err) {
+          if (err.code === 11000) {
+            const existingFormat = await db
+              .collection("Formats")
+              .findOne({ name: formatData.name });
+            console.error(`Duplicate format name: ${formatData.name}`);
+            return res.status(400).send({
+              message: `Format name "${formatData.name}" already exists`,
+              _id: existingFormat._id.toString(),
+            });
+          }
+          console.error("Failed to insert format:", err.message);
+          throw err;
+        }
+      } catch (error) {
+        console.error("Error creating format:", error.message);
+        res
+          .status(500)
+          .send({ message: "Error creating format", error: error.message });
+      }
+    });
+
+    app.put("/api/formats/:id", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("MongoDB connection failed");
+        }
+
+        const formatId = req.params.id;
+        const formatData = req.body;
+        if (!formatData.name) {
+          return res.status(400).send({ message: "Format name is required" });
+        }
+
+        console.log(`Updating format ID: ${formatId}, Data:`, formatData.name);
+
+        const validFields = [
+          "name",
+          "keyMappings",
+          "valueMappings",
+          "selectedColumns",
+          "nonZeroColumns",
+          "positionMappings",
+          "calculationType",
+          "calculatedColumnTypes",
+          "calculatedColumnIsCustomString",
+          "calculatedColumnNames",
+          "emptyColumnNames",
+          "coaTargetIifColumn",
+          "bankTargetIifColumn",
+          "storeSplitIifColumn",
+          "memoMappingType",
+          "selectedStates",
+          "selectedBrands",
+          "selectedStoreNames",
+          "normalizedColumnMap",
+          "calculatedColumns",
+        ];
+
+        const cleanedFormatData = Object.keys(formatData).reduce((acc, key) => {
+          if (validFields.includes(key)) {
+            acc[key] = formatData[key];
+          }
+          return acc;
+        }, {});
+
+        if (cleanedFormatData.calculatedColumns) {
+          if (!Array.isArray(cleanedFormatData.calculatedColumns)) {
+            return res
+              .status(400)
+              .send({ message: "calculatedColumns must be an array" });
+          }
+          cleanedFormatData.calculatedColumns =
+            cleanedFormatData.calculatedColumns.map((col) => ({
+              name: typeof col.name === "string" ? col.name : "",
+              formula: typeof col.formula === "string" ? col.formula : "",
+              selectedColumns: Array.isArray(col.selectedColumns)
+                ? col.selectedColumns
+                : [], // Validate selectedColumns
+              calculationType:
+                typeof col.calculationType === "string" &&
+                ["Formula", "Answer"].includes(col.calculationType)
+                  ? col.calculationType
+                  : "Answer",
+            }));
+        } else {
+          cleanedFormatData.calculatedColumns = [];
+        }
+
+        if (!Array.isArray(cleanedFormatData.emptyColumnNames)) {
+          cleanedFormatData.emptyColumnNames = [];
+        }
+
+        try {
+          const result = await db
+            .collection("Formats")
+            .updateOne(
+              { _id: new ObjectId(formatId) },
+              { $set: cleanedFormatData }
+            );
+
+          if (result.matchedCount === 0) {
+            console.warn(`No format found with ID: ${formatId}`);
+            return res.status(404).send({ message: "Format not found" });
+          }
+
+          console.log(
+            `Updated format ID: ${formatId}, Name: ${cleanedFormatData.name}`
+          );
+          const updatedFormat = await db
+            .collection("Formats")
+            .findOne({ _id: new ObjectId(formatId) });
+          res.status(200).send({
+            ...updatedFormat,
+            _id: updatedFormat._id.toString(),
+          });
+        } catch (err) {
+          if (err.code === 11000) {
+            console.error(`Duplicate format name: ${formatData.name}`);
+            const existingFormat = await db
+              .collection("Formats")
+              .findOne({ name: formatData.name });
+            return res.status(400).send({
+              message: `Format name "${formatData.name}" already exists`,
+              _id: existingFormat._id.toString(),
+            });
+          }
+          console.error("Failed to update format:", err.message);
+          throw err;
+        }
+      } catch (error) {
+        console.error("Error updating format:", error.message);
+        res
+          .status(500)
+          .send({ message: "Error updating format", error: error.message });
+      }
+    });
+
+    app.post("/api/upload", upload.array("files"), async (req, res) => {
+      try {
+        if (!req.files || req.files.length === 0) {
+          return res.status(400).send({ message: "No files uploaded" });
+        }
+
+        let totalInserted = 0;
+        let totalDuplicates = 0;
+        let totalSheets = 0;
+
+        const filePromises = req.files.map(async (file) => {
+          const filePath = file.path;
+          const fileExtension = file.originalname
+            .split(".")
+            .pop()
+            .toLowerCase();
+          let data = [];
+          let sheetCount = 1;
+
+          try {
+            if (fileExtension === "csv") {
+              await new Promise((resolve, reject) => {
+                const results = [];
+                fs.createReadStream(filePath)
+                  .pipe(csv())
+                  .on("data", (row) => {
+                    const cleanedRow = cleanObjectForDataSummary(row);
+                    if (Object.keys(cleanedRow).length > 0) {
+                      results.push(cleanedRow);
+                    }
+                  })
+                  .on("end", () => {
+                    data = results;
+                    resolve();
+                  })
+                  .on("error", reject);
+              });
+            } else if (fileExtension === "xlsx" || fileExtension === "xls") {
+              const workbook = XLSX.readFile(filePath);
+              const sheetNames = workbook.SheetNames;
+              sheetCount = sheetNames.length;
+
+              for (const sheetName of sheetNames) {
+                const sheet = workbook.Sheets[sheetName];
+                const rawData = XLSX.utils.sheet_to_json(sheet, {
+                  defval: null,
+                });
+                const sheetData = rawData
+                  .map(cleanObjectForDataSummary)
+                  .filter((row) => Object.keys(row).length > 0);
+                console.log(
+                  `Processed sheet: ${sheetName}, Rows: ${sheetData.length}`
+                );
+                data = data.concat(sheetData);
+              }
+            } else {
+              throw new Error("Invalid file format");
+            }
+
+            if (data.length === 0) {
+              console.warn("No data processed from file:", filePath);
+              return { insertedCount: 0, duplicateCount: 0, sheetCount };
+            }
+
+            const keys = data
+              .filter((record) => record.StoreName && record.Date)
+              .map((record) => ({
+                StoreName: record.StoreName,
+                Date: record.Date,
+              }));
+
+            const existingRecords = await db
+              .collection("DataSummary")
+              .find({
+                $or: keys,
+              })
+              .project({ StoreName: 1, Date: 1 })
+              .toArray();
+
+            const existingKeys = new Set(
+              existingRecords.map((r) => `${r.StoreName}|${r.Date}`)
+            );
+
+            const recordsToInsert = data.filter((record) => {
+              if (!record.StoreName || !record.Date) {
+                console.warn(
+                  "Skipping record missing StoreName or Date:",
+                  record
+                );
+                return false;
+              }
+              const key = `${record.StoreName}|${record.Date}`;
+              return !existingKeys.has(key);
+            });
+
+            let insertedCount = 0;
+            let duplicateCount = data.length - recordsToInsert.length;
+
+            if (recordsToInsert.length > 0) {
+              const result = await db
+                .collection("DataSummary")
+                .insertMany(recordsToInsert, { ordered: false });
+              insertedCount = result.insertedCount;
+              console.log(
+                `Insert result for file ${file.originalname}:`,
+                insertedCount,
+                "documents"
+              );
+            }
+
+            return { insertedCount, duplicateCount, sheetCount };
+          } finally {
+            await fs
+              .unlink(filePath)
+              .catch((err) =>
+                console.error(`Failed to delete file ${filePath}:`, err)
+              );
+          }
+        });
+
+        const results = await Promise.all(filePromises);
+
+        totalInserted = results.reduce((sum, r) => sum + r.insertedCount, 0);
+        totalDuplicates = results.reduce((sum, r) => sum + r.duplicateCount, 0);
+        totalSheets = results.reduce((sum, r) => sum + r.sheetCount, 0);
+
+        const response = {
+          message:
+            totalInserted > 0
+              ? "Data uploaded successfully"
+              : totalDuplicates > 0
+              ? "No new data uploaded; all records were duplicates"
+              : "No valid data to insert",
+          insertedCount: totalInserted,
+          duplicateCount: totalDuplicates,
+          sheetCount: totalSheets,
+          fileCount: req.files.length,
+        };
+
+        console.log("Upload response:", response);
+        res.send(response);
       } catch (err) {
         console.error("Upload error:", err);
         res
           .status(500)
-          .send({ message: "Error uploading file", error: err.message });
+          .send({ message: "Error uploading files", error: err.message });
       }
     });
 
-    // Data endpoint for CTData
     app.post("/api/data", async (req, res) => {
       try {
         if (!db) {
@@ -353,7 +654,7 @@ connectToMongoDB()
         const endDateObj = end.toDate();
 
         const data = await db
-          .collection("CTData")
+          .collection("DataSummary")
           .aggregate([
             {
               $addFields: {
@@ -380,7 +681,7 @@ connectToMongoDB()
           .toArray();
 
         console.log(
-          "Found CTData records:",
+          "Found DataSummary records:",
           data.length,
           "Sample:",
           data.slice(0, 2)
@@ -388,11 +689,11 @@ connectToMongoDB()
 
         if (data.length === 0) {
           const sample = await db
-            .collection("CTData")
+            .collection("DataSummary")
             .find()
             .limit(5)
             .toArray();
-          console.log("Sample CTData in DB:", sample);
+          console.log("Sample DataSummary in DB:", sample);
           return res.send(data);
         }
 
@@ -405,7 +706,7 @@ connectToMongoDB()
         finalColumns.push(...allColumns);
 
         const normalizedData = data.map((record) => {
-          const normalizedRecord = {};
+          const normalizedRecord = { _id: record._id.toString() };
           finalColumns.forEach((col) => {
             normalizedRecord[col] =
               record[col] !== undefined ? record[col] : null;
@@ -413,15 +714,159 @@ connectToMongoDB()
           return normalizedRecord;
         });
 
-        console.log("Normalized CTData sample:", normalizedData.slice(0, 2));
+        console.log(
+          "Normalized DataSummary sample:",
+          normalizedData.slice(0, 2)
+        );
         res.send(normalizedData);
       } catch (err) {
-        console.error("Error fetching CTData:", err);
+        console.error("Error fetching DataSummary:", err);
         res.status(500).send({ message: "Error fetching data" });
       }
     });
 
-    // Upload endpoint for BMData
+    app.post("/api/data-update", async (req, res) => {
+      try {
+        const { id, updates } = req.body;
+        if (!id || !updates) {
+          console.error("Invalid update request:", { id, updates });
+          return res
+            .status(400)
+            .send({ message: "Invalid update request: Missing id or updates" });
+        }
+
+        console.log("Received update request:", { id, updates });
+
+        let objectId;
+        try {
+          objectId = new ObjectId(id);
+        } catch (err) {
+          console.error("Invalid ObjectId:", id);
+          return res.status(400).send({ message: "Invalid ObjectId format" });
+        }
+
+        const beforeUpdate = await db
+          .collection("DataSummary")
+          .findOne({ _id: objectId });
+        console.log("Record before update:", beforeUpdate);
+
+        const cleanedUpdates = cleanObjectForDataSummary(updates);
+        console.log("Cleaned updates:", cleanedUpdates);
+
+        const result = await db
+          .collection("DataSummary")
+          .updateOne({ _id: objectId }, { $set: cleanedUpdates });
+
+        console.log("Update result:", {
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+          acknowledged: result.acknowledged,
+        });
+
+        const afterUpdate = await db
+          .collection("DataSummary")
+          .findOne({ _id: objectId });
+        console.log("Record after update:", afterUpdate);
+
+        if (result.matchedCount === 0) {
+          console.warn("No record found for ID:", id);
+          return res.status(404).send({ message: "Record not found" });
+        }
+
+        if (result.modifiedCount === 0) {
+          console.warn("No changes applied for ID:", id);
+          return res.status(200).send({
+            message: "No changes applied to the record",
+            before: beforeUpdate,
+            after: afterUpdate,
+          });
+        }
+
+        res.send({
+          message: "Data updated successfully",
+          modifiedCount: result.modifiedCount,
+          before: beforeUpdate,
+          after: afterUpdate,
+        });
+      } catch (err) {
+        console.error("Error updating data:", err);
+        res
+          .status(500)
+          .send({ message: "Error updating data", error: err.message });
+      }
+    });
+
+    app.post("/api/data-calculated-column", async (req, res) => {
+      try {
+        const { column, updates, isNewColumn } = req.body;
+        if (!column || !updates || updates.length === 0) {
+          console.error("Invalid calculated column request:", {
+            column,
+            updates,
+          });
+          return res
+            .status(400)
+            .send({ message: "Invalid request: Missing column or updates" });
+        }
+
+        console.log("Received calculated column request:", {
+          column,
+          updateCount: updates.length,
+          isNewColumn,
+        });
+
+        let modifiedCount = 0;
+        for (const update of updates) {
+          const { _id, value } = update;
+          try {
+            const objectId = new ObjectId(_id);
+            const updateOperation = isNewColumn
+              ? { $set: { [column]: value } }
+              : { $set: { [column]: value } };
+
+            const result = await db
+              .collection("DataSummary")
+              .updateOne({ _id: objectId }, updateOperation);
+
+            if (result.matchedCount === 0) {
+              console.warn(`No record found for ID: ${_id}`);
+              continue;
+            }
+
+            modifiedCount += result.modifiedCount;
+          } catch (err) {
+            console.error(`Error processing update for ID ${_id}:`, err);
+            continue;
+          }
+        }
+
+        console.log("Calculated column update result:", {
+          modifiedCount,
+          totalUpdates: updates.length,
+        });
+
+        if (modifiedCount === 0) {
+          return res.status(200).send({
+            message: "No records were modified",
+            modifiedCount,
+          });
+        }
+
+        res.send({
+          message: isNewColumn
+            ? `New column '${column}' added successfully`
+            : `Column '${column}' updated successfully`,
+          modifiedCount,
+        });
+      } catch (err) {
+        console.error("Error processing calculated column:", err);
+        res.status(500).send({
+          message: "Error processing calculated column",
+          error: err.message,
+        });
+      }
+    });
+
     app.post(
       "/api/bank-mapping-upload",
       upload.single("file"),
@@ -487,7 +932,6 @@ connectToMongoDB()
       }
     );
 
-    // Fetch endpoint for BMData
     app.post("/api/bank-mapping-data", async (req, res) => {
       try {
         if (!db) {
@@ -554,7 +998,6 @@ connectToMongoDB()
       }
     });
 
-    // Delete endpoint for BMData
     app.post("/api/bank-mapping-delete", async (req, res) => {
       try {
         const { ids } = req.body;
@@ -578,7 +1021,6 @@ connectToMongoDB()
       }
     });
 
-    // Update endpoint for BMData
     app.post("/api/bank-mapping-update", async (req, res) => {
       try {
         const { id, updates } = req.body;
@@ -586,7 +1028,7 @@ connectToMongoDB()
           return res.status(400).send({ message: "Invalid update request" });
         }
 
-        const cleanedUpdates = cleanObjectForBMData(updates); // Preserve existing _id if present
+        const cleanedUpdates = cleanObjectForBMData(updates);
         const result = await db
           .collection("BMData")
           .updateOne({ _id: new ObjectId(id) }, { $set: cleanedUpdates });
