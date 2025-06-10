@@ -27,6 +27,7 @@ app.use((req, res, next) => {
 const mongoUrl =
   "mongodb+srv://krushant:kK58jbHcl5taHmNb@transactions-cluster.bkfz4.mongodb.net/?retryWrites=true&w=majority&appName=transactions-cluster";
 const dbName = "transactionsDB";
+const brandsDbName = "brandsDB";
 
 const upload = multer({
   dest: "./Uploads/",
@@ -45,6 +46,7 @@ const upload = multer({
 });
 
 let db;
+let brandsDb;
 let mongoClient;
 
 async function connectToMongoDB() {
@@ -54,9 +56,10 @@ async function connectToMongoDB() {
       socketTimeoutMS: 30000,
     });
     db = client.db(dbName);
+    brandsDb = client.db(brandsDbName);
     console.log("Connected to MongoDB");
-    await db.collection("DataSummary").createIndex({ Date: 1 });
-    await db.collection("DataSummary").createIndex({ StoreName: 1, Date: 1 });
+    await db.collection("SampleData").createIndex({ Date: 1 });
+    await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
     await db.collection("BMData").createIndex({ store_name: 1 });
     await db.collection("Formats").createIndex({ name: 1 }, { unique: true });
     return client;
@@ -69,14 +72,15 @@ async function connectToMongoDB() {
   }
 }
 
-// Clean column names and values for DataSummary
-function cleanObjectForDataSummary(obj) {
+// Clean column names and values for SampleData
+function cleanObjectForSampleData(obj) {
   console.log("Processing columns and sample values:", {
     columns: Object.keys(obj),
     sample: obj,
   });
   return Object.keys(obj).reduce((acc, key) => {
-    const cleanKey = key.trim().replace(/\s+/g, "");
+    // Replace dots with underscores and remove extra spaces
+    const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
     let value = obj[key];
 
     if (typeof value === "string") {
@@ -152,6 +156,22 @@ function cleanObjectForBMData(obj) {
 connectToMongoDB()
   .then((client) => {
     mongoClient = client;
+
+    // Endpoint to get brand collections
+    app.get("/api/brands", async (req, res) => {
+      try {
+        if (!brandsDb) {
+          await connectToMongoDB();
+          if (!brandsDb) throw new Error("Failed to connect to MongoDB");
+        }
+        const collections = await brandsDb.listCollections().toArray();
+        const brandNames = collections.map((col) => col.name);
+        res.send(brandNames);
+      } catch (err) {
+        console.error("Error fetching brands:", err);
+        res.status(500).send({ message: "Error fetching brands" });
+      }
+    });
 
     app.get("/api/filter-options", async (req, res) => {
       try {
@@ -297,7 +317,7 @@ connectToMongoDB()
               formula: typeof col.formula === "string" ? col.formula : "",
               selectedColumns: Array.isArray(col.selectedColumns)
                 ? col.selectedColumns
-                : [], // Validate selectedColumns
+                : [],
               calculationType:
                 typeof col.calculationType === "string" &&
                 ["Formula", "Answer"].includes(col.calculationType)
@@ -407,7 +427,7 @@ connectToMongoDB()
               formula: typeof col.formula === "string" ? col.formula : "",
               selectedColumns: Array.isArray(col.selectedColumns)
                 ? col.selectedColumns
-                : [], // Validate selectedColumns
+                : [],
               calculationType:
                 typeof col.calculationType === "string" &&
                 ["Formula", "Answer"].includes(col.calculationType)
@@ -472,6 +492,10 @@ connectToMongoDB()
         if (!req.files || req.files.length === 0) {
           return res.status(400).send({ message: "No files uploaded" });
         }
+        const brand = req.body.brand;
+        if (!brand) {
+          return res.status(400).send({ message: "Brand is required" });
+        }
 
         let totalInserted = 0;
         let totalDuplicates = 0;
@@ -493,7 +517,7 @@ connectToMongoDB()
                 fs.createReadStream(filePath)
                   .pipe(csv())
                   .on("data", (row) => {
-                    const cleanedRow = cleanObjectForDataSummary(row);
+                    const cleanedRow = cleanObjectForSampleData(row);
                     if (Object.keys(cleanedRow).length > 0) {
                       results.push(cleanedRow);
                     }
@@ -515,7 +539,7 @@ connectToMongoDB()
                   defval: null,
                 });
                 const sheetData = rawData
-                  .map(cleanObjectForDataSummary)
+                  .map(cleanObjectForSampleData)
                   .filter((row) => Object.keys(row).length > 0);
                 console.log(
                   `Processed sheet: ${sheetName}, Rows: ${sheetData.length}`
@@ -538,8 +562,8 @@ connectToMongoDB()
                 Date: record.Date,
               }));
 
-            const existingRecords = await db
-              .collection("DataSummary")
+            const existingRecords = await brandsDb
+              .collection(brand)
               .find({
                 $or: keys,
               })
@@ -566,8 +590,8 @@ connectToMongoDB()
             let duplicateCount = data.length - recordsToInsert.length;
 
             if (recordsToInsert.length > 0) {
-              const result = await db
-                .collection("DataSummary")
+              const result = await brandsDb
+                .collection(brand)
                 .insertMany(recordsToInsert, { ordered: false });
               insertedCount = result.insertedCount;
               console.log(
@@ -618,20 +642,21 @@ connectToMongoDB()
 
     app.post("/api/data", async (req, res) => {
       try {
-        if (!db) {
+        if (!brandsDb) {
           await connectToMongoDB();
-          if (!db) throw new Error("Failed to reconnect to MongoDB");
+          if (!brandsDb) throw new Error("Failed to reconnect to MongoDB");
         }
 
-        const { startDate, endDate } = req.body;
-        if (!startDate || !endDate) {
+        const { startDate, endDate, brand } = req.body;
+        if (!startDate || !endDate || !brand) {
           return res
             .status(400)
-            .send({ message: "Start and end dates required" });
+            .send({ message: "Start date, end date, and brand are required" });
         }
 
         console.log("Incoming startDate:", startDate);
         console.log("Incoming endDate:", endDate);
+        console.log("Brand:", brand);
 
         const start = moment(
           startDate,
@@ -650,50 +675,38 @@ connectToMongoDB()
           });
         }
 
-        const startDateObj = start.toDate();
-        const endDateObj = end.toDate();
+        const formattedStartDate = start.format("MM-DD-YYYY");
+        const formattedEndDate = end.format("MM-DD-YYYY");
 
-        const data = await db
-          .collection("DataSummary")
-          .aggregate([
-            {
-              $addFields: {
-                dateAsDate: {
-                  $dateFromString: {
-                    dateString: {
-                      $ifNull: ["$Date", moment().format("MM-DD-YYYY")],
-                    },
-                    format: "%m-%d-%Y",
-                    onError: moment().format("MM-DD-YYYY"),
-                  },
-                },
-              },
+        console.log("Querying with formatted startDate:", formattedStartDate);
+        console.log("Querying with formatted endDate:", formattedEndDate);
+
+        const data = await brandsDb
+          .collection(brand)
+          .find({
+            Date: {
+              $gte: formattedStartDate,
+              $lte: formattedEndDate,
             },
-            {
-              $match: {
-                dateAsDate: { $gte: startDateObj, $lte: endDateObj },
-              },
-            },
-            {
-              $project: { dateAsDate: 0 },
-            },
-          ])
+          })
           .toArray();
 
         console.log(
-          "Found DataSummary records:",
+          "Found records for brand:",
+          brand,
+          "Count:",
           data.length,
           "Sample:",
           data.slice(0, 2)
         );
 
         if (data.length === 0) {
-          const sample = await db
-            .collection("DataSummary")
+          const sample = await brandsDb
+            .collection(brand)
             .find()
             .limit(5)
             .toArray();
-          console.log("Sample DataSummary in DB:", sample);
+          console.log("Sample data in DB for brand:", brand, sample);
           return res.send(data);
         }
 
@@ -715,27 +728,28 @@ connectToMongoDB()
         });
 
         console.log(
-          "Normalized DataSummary sample:",
+          "Normalized data sample for brand:",
+          brand,
           normalizedData.slice(0, 2)
         );
         res.send(normalizedData);
       } catch (err) {
-        console.error("Error fetching DataSummary:", err);
+        console.error("Error fetching data:", err);
         res.status(500).send({ message: "Error fetching data" });
       }
     });
 
     app.post("/api/data-update", async (req, res) => {
       try {
-        const { id, updates } = req.body;
-        if (!id || !updates) {
-          console.error("Invalid update request:", { id, updates });
-          return res
-            .status(400)
-            .send({ message: "Invalid update request: Missing id or updates" });
+        const { id, updates, brand } = req.body;
+        if (!id || !updates || !brand) {
+          console.error("Invalid update request:", { id, updates, brand });
+          return res.status(400).send({
+            message: "Invalid update request: Missing id, updates, or brand",
+          });
         }
 
-        console.log("Received update request:", { id, updates });
+        console.log("Received update request:", { id, updates, brand });
 
         let objectId;
         try {
@@ -745,17 +759,25 @@ connectToMongoDB()
           return res.status(400).send({ message: "Invalid ObjectId format" });
         }
 
-        const beforeUpdate = await db
-          .collection("DataSummary")
+        const beforeUpdate = await brandsDb
+          .collection(brand)
           .findOne({ _id: objectId });
         console.log("Record before update:", beforeUpdate);
 
-        const cleanedUpdates = cleanObjectForDataSummary(updates);
+        const cleanedUpdates = cleanObjectForSampleData(updates);
         console.log("Cleaned updates:", cleanedUpdates);
 
-        const result = await db
-          .collection("DataSummary")
-          .updateOne({ _id: objectId }, { $set: cleanedUpdates });
+        // Create the $set stage, ensuring field names with dots are preserved
+        const setStage = {
+          $set: Object.keys(cleanedUpdates).reduce((acc, key) => {
+            acc[key] = cleanedUpdates[key];
+            return acc;
+          }, {}),
+        };
+
+        const result = await brandsDb
+          .collection(brand)
+          .updateOne({ _id: objectId }, [setStage]);
 
         console.log("Update result:", {
           matchedCount: result.matchedCount,
@@ -763,8 +785,8 @@ connectToMongoDB()
           acknowledged: result.acknowledged,
         });
 
-        const afterUpdate = await db
-          .collection("DataSummary")
+        const afterUpdate = await brandsDb
+          .collection(brand)
           .findOne({ _id: objectId });
         console.log("Record after update:", afterUpdate);
 
@@ -796,23 +818,108 @@ connectToMongoDB()
       }
     });
 
+    app.post("/api/data-bulk-update", async (req, res) => {
+      try {
+        const { updates, brand } = req.body;
+        if (
+          !updates ||
+          !Array.isArray(updates) ||
+          updates.length === 0 ||
+          !brand
+        ) {
+          console.error("Invalid bulk update request:", { updates, brand });
+          return res.status(400).send({
+            message:
+              "Invalid bulk update request: Missing or invalid updates or brand",
+          });
+        }
+
+        console.log("Received bulk update request:", {
+          updateCount: updates.length,
+          brand,
+        });
+
+        const bulkOperations = updates
+          .map(({ id, updates }) => {
+            let objectId;
+            try {
+              objectId = new ObjectId(id);
+            } catch (err) {
+              console.warn("Invalid ObjectId skipped:", id);
+              return null;
+            }
+
+            const cleanedUpdates = cleanObjectForSampleData(updates);
+            console.log("Cleaned updates for ID:", { id, cleanedUpdates });
+
+            return {
+              updateOne: {
+                filter: { _id: objectId },
+                update: {
+                  $set: Object.keys(cleanedUpdates).reduce((acc, key) => {
+                    acc[key] = cleanedUpdates[key];
+                    return acc;
+                  }, {}),
+                },
+              },
+            };
+          })
+          .filter((op) => op !== null);
+
+        if (bulkOperations.length === 0) {
+          console.warn("No valid operations to process");
+          return res
+            .status(400)
+            .send({ message: "No valid updates to process" });
+        }
+
+        const result = await brandsDb
+          .collection(brand)
+          .bulkWrite(bulkOperations, { ordered: false });
+
+        console.log("Bulk update result:", {
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+          acknowledged: result.acknowledged,
+        });
+
+        if (result.matchedCount === 0) {
+          console.warn("No records found for bulk update");
+          return res.status(404).send({ message: "No records found" });
+        }
+
+        res.send({
+          message: "Bulk data updated successfully",
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (err) {
+        console.error("Error during bulk update:", err);
+        res
+          .status(500)
+          .send({ message: "Error updating data", error: err.message });
+      }
+    });
+
     app.post("/api/data-calculated-column", async (req, res) => {
       try {
-        const { column, updates, isNewColumn } = req.body;
-        if (!column || !updates || updates.length === 0) {
+        const { column, updates, isNewColumn, brand } = req.body;
+        if (!column || !updates || updates.length === 0 || !brand) {
           console.error("Invalid calculated column request:", {
             column,
             updates,
+            brand,
           });
-          return res
-            .status(400)
-            .send({ message: "Invalid request: Missing column or updates" });
+          return res.status(400).send({
+            message: "Invalid request: Missing column, updates, or brand",
+          });
         }
 
         console.log("Received calculated column request:", {
           column,
           updateCount: updates.length,
           isNewColumn,
+          brand,
         });
 
         let modifiedCount = 0;
@@ -824,8 +931,8 @@ connectToMongoDB()
               ? { $set: { [column]: value } }
               : { $set: { [column]: value } };
 
-            const result = await db
-              .collection("DataSummary")
+            const result = await brandsDb
+              .collection(brand)
               .updateOne({ _id: objectId }, updateOperation);
 
             if (result.matchedCount === 0) {
@@ -917,7 +1024,7 @@ connectToMongoDB()
             "documents"
           );
 
-          fs.unlinkSync(filePath);
+          await fs.unlink(filePath);
           res.send({
             message: "Bank mapping data uploaded successfully",
             insertedCount: result.insertedCount,
@@ -935,7 +1042,9 @@ connectToMongoDB()
     app.post("/api/bank-mapping-data", async (req, res) => {
       try {
         if (!db) {
-          return res.status(503).send({ message: "Database not connected" });
+          await connectToMongoDB();
+          if (!db)
+            return res.status(503).send({ message: "Database not connected" });
         }
 
         const body = req.body || {};
