@@ -5,6 +5,8 @@ import csv from "csv-parser";
 import fs from "fs/promises";
 import XLSX from "xlsx";
 import moment from "moment";
+import { evaluate } from "mathjs";
+import { v4 as uuidv4 } from "uuid";
 
 const app = express();
 app.use(express.json());
@@ -62,6 +64,9 @@ async function connectToMongoDB() {
     await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
     await db.collection("BMData").createIndex({ store_name: 1 });
     await db.collection("Formats").createIndex({ name: 1 }, { unique: true });
+    await db
+      .collection("Formulas")
+      .createIndex({ formula: 1, column: 1, brand: 1 }, { unique: true });
     return client;
   } catch (err) {
     console.error("Error connecting to MongoDB:", {
@@ -130,6 +135,23 @@ function cleanObjectForSampleData(obj) {
   }, {});
 }
 
+async function initializeTransactionLog() {
+  try {
+    await db
+      .collection("TransactionLog")
+      .createIndex({ transactionId: 1 }, { unique: true });
+    await db
+      .collection("TransactionLog")
+      .createIndex({ brand: 1, status: 1, createdAt: -1 });
+    await db
+      .collection("TransactionLog")
+      .createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // 30 days TTL
+    console.log("TransactionLog collection initialized");
+  } catch (err) {
+    console.error("Error initializing TransactionLog:", err);
+  }
+}
+
 // Clean column names and values for BMData
 function cleanObjectForBMData(obj) {
   const cleaned = Object.keys(obj).reduce((acc, key) => {
@@ -156,7 +178,7 @@ function cleanObjectForBMData(obj) {
 connectToMongoDB()
   .then((client) => {
     mongoClient = client;
-
+    initializeTransactionLog();
     // Endpoint to get brand collections
     app.get("/api/brands", async (req, res) => {
       try {
@@ -231,6 +253,146 @@ connectToMongoDB()
       } catch (err) {
         console.error("Error fetching filter options:", err);
         res.status(500).send({ message: "Error fetching filter options" });
+      }
+    });
+
+    app.get("/api/formulas", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("Failed to connect to MongoDB");
+        }
+        const formulas = await db.collection("Formulas").find({}).toArray();
+        console.log(`Retrieved ${formulas.length} formulas`);
+        res.status(200).send(
+          formulas.map((formula) => ({
+            ...formula,
+            _id: formula._id.toString(),
+          }))
+        );
+      } catch (err) {
+        console.error("Error retrieving formulas:", err);
+        res
+          .status(500)
+          .send({ message: "Error retrieving formulas", error: err.message });
+      }
+    });
+
+    app.post("/api/formulas", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("Failed to connect to MongoDB");
+        }
+
+        const { formula, column, selected, brand } = req.body;
+        if (!formula || !column || !brand) {
+          return res
+            .status(400)
+            .send({ message: "Formula, column, and brand are required" });
+        }
+
+        console.log("Creating formula:", { formula, column, selected, brand });
+
+        if (selected) {
+          await db
+            .collection("Formulas")
+            .updateMany(
+              { brand, selected: true },
+              { $set: { selected: false } }
+            );
+        }
+
+        const result = await db.collection("Formulas").insertOne({
+          formula,
+          column,
+          selected: !!selected,
+          brand,
+          createdAt: new Date(),
+        });
+
+        console.log("Formula created:", result.insertedId);
+        res.status(201).send({
+          _id: result.insertedId.toString(),
+          formula,
+          column,
+          selected: !!selected,
+          brand,
+          createdAt: new Date(),
+        });
+      } catch (err) {
+        console.error("Error creating formula:", err);
+        if (err.code === 11000) {
+          return res.status(400).send({
+            message: "Formula for this column and brand already exists",
+          });
+        }
+        res
+          .status(500)
+          .send({ message: "Error creating formula", error: err.message });
+      }
+    });
+
+    app.put("/api/formulas/:id", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("MongoDB connection failed");
+        }
+
+        const formulaId = req.params.id;
+        const { selected } = req.body;
+
+        console.log(`Toggling formula ID: ${formulaId}, selected: ${selected}`);
+
+        let updateResult;
+        if (selected) {
+          const formula = await db
+            .collection("Formulas")
+            .findOne({ _id: new ObjectId(formulaId) });
+          if (!formula) {
+            return res.status(404).send({ message: "Formula not found" });
+          }
+          await db.collection("Formulas").updateMany(
+            {
+              brand: formula.brand,
+              selected: true,
+              _id: { $ne: new ObjectId(formulaId) },
+            },
+            { $set: { selected: false } }
+          );
+          updateResult = await db
+            .collection("Formulas")
+            .updateOne(
+              { _id: new ObjectId(formulaId) },
+              { $set: { selected: true } }
+            );
+        } else {
+          updateResult = await db
+            .collection("Formulas")
+            .updateOne(
+              { _id: new ObjectId(formulaId) },
+              { $set: { selected: false } }
+            );
+        }
+
+        if (updateResult.matchedCount === 0) {
+          return res.status(404).send({ message: "Formula not found" });
+        }
+
+        const updatedFormula = await db
+          .collection("Formulas")
+          .findOne({ _id: new ObjectId(formulaId) });
+        res.status(200).send({
+          ...updatedFormula,
+          _id: updatedFormula._id.toString(),
+          selected: updatedFormula.selected,
+        });
+      } catch (err) {
+        console.error("Error toggling formula:", err);
+        res
+          .status(500)
+          .send({ message: "Error toggling formula", error: err.message });
       }
     });
 
@@ -839,65 +1001,244 @@ connectToMongoDB()
           brand,
         });
 
-        const bulkOperations = updates
-          .map(({ id, updates }) => {
-            let objectId;
-            try {
-              objectId = new ObjectId(id);
-            } catch (err) {
-              console.warn("Invalid ObjectId skipped:", id);
-              return null;
-            }
+        const activeFormula = await db
+          .collection("Formulas")
+          .findOne({ brand, selected: true });
 
-            const cleanedUpdates = cleanObjectForSampleData(updates);
-            console.log("Cleaned updates for ID:", { id, cleanedUpdates });
+        console.log("Active formula:", activeFormula || "None");
 
-            return {
-              updateOne: {
-                filter: { _id: objectId },
-                update: {
-                  $set: Object.keys(cleanedUpdates).reduce((acc, key) => {
-                    acc[key] = cleanedUpdates[key];
-                    return acc;
-                  }, {}),
+        const formulaColumnsCache = new Map();
+        const transactionId = uuidv4();
+        const transactionLog = {
+          transactionId,
+          brand,
+          operation: "bulk-update",
+          status: "active",
+          updates: [],
+          createdAt: new Date(),
+        };
+
+        const bulkOperations = await Promise.all(
+          updates
+            .map(async ({ id, updates }) => {
+              let objectId;
+              try {
+                objectId = new ObjectId(id);
+              } catch (err) {
+                console.warn("Invalid ObjectId skipped:", id);
+                return null;
+              }
+
+              const cleanedUpdates = cleanObjectForSampleData(updates);
+              console.log("Cleaned updates for ID:", id, cleanedUpdates);
+
+              // Fetch original record to log previous values
+              const originalRecord = await brandsDb
+                .collection(brand)
+                .findOne({ _id: objectId }, { projection: { _id: 0 } });
+
+              if (!originalRecord) {
+                console.warn(`Record not found for ID: ${id}`);
+                return null;
+              }
+
+              let additionalUpdates = {};
+              if (activeFormula) {
+                const { formula, column } = activeFormula;
+                console.log(
+                  `Applying formula ${formula} to column ${column} for ID ${id}`
+                );
+
+                let expression = formula;
+                let resultIsString = false;
+
+                let formulaColumns = formulaColumnsCache.get(formula);
+                if (!formulaColumns) {
+                  formulaColumns = [];
+                  const recordKeys = Object.keys(originalRecord).filter(
+                    (key) => key !== "_id"
+                  );
+                  recordKeys.forEach((key) => {
+                    const escapedKey = key.replace(
+                      /[.*+?^${}()|[\]\\]/g,
+                      "\\$&"
+                    );
+                    const regex = new RegExp(
+                      `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
+                      "gi"
+                    );
+                    if (regex.test(formula)) {
+                      formulaColumns.push({ key, regex });
+                    }
+                  });
+                  formulaColumnsCache.set(formula, formulaColumns);
+                  console.log(
+                    "Formula columns detected:",
+                    formulaColumns.map((c) => c.key)
+                  );
+                }
+
+                formulaColumns.forEach(({ key }) => {
+                  let cellValue =
+                    key in cleanedUpdates
+                      ? cleanedUpdates[key]
+                      : originalRecord[key];
+                  if (
+                    cellValue === null ||
+                    cellValue === undefined ||
+                    cellValue === ""
+                  ) {
+                    cellValue = 0;
+                  } else if (typeof cellValue === "string") {
+                    const cleanedValue = cellValue.replace(/[^0-9.-]/g, "");
+                    const parsedValue = parseFloat(cleanedValue);
+                    if (
+                      isNaN(parsedValue) ||
+                      !cleanedValue.match(/^-?\d*\.?\d*$/)
+                    ) {
+                      resultIsString = true;
+                      cellValue = `"${cellValue}"`;
+                    } else {
+                      cellValue = parsedValue;
+                    }
+                  }
+                  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                  const regex = new RegExp(
+                    `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
+                    "g"
+                  );
+                  expression = expression.replace(regex, `$1${cellValue}$3`);
+                  console.log(
+                    `Replaced ${key} with ${cellValue} in expression: ${expression}`
+                  );
+                });
+
+                try {
+                  let result;
+                  if (resultIsString) {
+                    result = expression.replace(/"/g, "");
+                    console.log(`String result for ${column}: ${result}`);
+                  } else {
+                    result = evaluate(expression);
+                    if (isNaN(result) || !isFinite(result)) {
+                      throw new Error(
+                        `Formula evaluation resulted in invalid number: "${result}"`
+                      );
+                    }
+                    console.log(`Numeric result for ${column}: ${result}`);
+                  }
+                  additionalUpdates[column] = result;
+                } catch (error) {
+                  console.error(
+                    `Error evaluating formula for ID ${id}: ${error.message}`,
+                    { expression, formula, column }
+                  );
+                  additionalUpdates[column] = 0;
+                }
+              }
+
+              // Log the original and new values
+              const allUpdates = { ...cleanedUpdates, ...additionalUpdates };
+              const originalValues = {};
+              Object.keys(allUpdates).forEach((key) => {
+                originalValues[key] =
+                  originalRecord[key] !== undefined
+                    ? originalRecord[key]
+                    : null;
+              });
+
+              transactionLog.updates.push({
+                id,
+                originalValues,
+                newValues: allUpdates,
+              });
+
+              return {
+                updateOne: {
+                  filter: { _id: objectId },
+                  update: {
+                    $set: {
+                      ...Object.keys(cleanedUpdates).reduce((acc, key) => {
+                        acc[key] = cleanedUpdates[key];
+                        return acc;
+                      }, {}),
+                      ...additionalUpdates,
+                    },
+                  },
                 },
-              },
-            };
-          })
-          .filter((op) => op !== null);
+              };
+            })
+            .filter((op) => op !== null)
+        );
 
         if (bulkOperations.length === 0) {
-          console.warn("No valid operations to process");
+          console.warn("No valid operations to execute");
           return res
             .status(400)
             .send({ message: "No valid updates to process" });
         }
 
+        // Save transaction log
+        await db.collection("TransactionLog").insertOne(transactionLog);
+        console.log("Transaction logged:", transactionId);
+
         const result = await brandsDb
           .collection(brand)
-          .bulkWrite(bulkOperations, { ordered: false });
+          .bulkWrite(bulkOperations);
 
         console.log("Bulk update result:", {
           matchedCount: result.matchedCount,
           modifiedCount: result.modifiedCount,
-          acknowledged: result.acknowledged,
         });
-
-        if (result.matchedCount === 0) {
-          console.warn("No records found for bulk update");
-          return res.status(404).send({ message: "No records found" });
-        }
 
         res.send({
-          message: "Bulk data updated successfully",
+          message: "Bulk update completed",
           matchedCount: result.matchedCount,
           modifiedCount: result.modifiedCount,
+          transactionId,
         });
       } catch (err) {
-        console.error("Error during bulk update:", err);
-        res
-          .status(500)
-          .send({ message: "Error updating data", error: err.message });
+        console.error("Error in bulk update:", err);
+        res.status(500).send({
+          message: "Error performing bulk update",
+          error: err.message,
+        });
+      }
+    });
+
+    app.post("/api/clear-transaction-logs", async (req, res) => {
+      try {
+        const { brand } = req.body;
+        if (!brand) {
+          return res.status(400).send({ message: "Brand is required" });
+        }
+
+        // Log sample TransactionLog entries for debugging
+        const sampleLogs = await db
+          .collection("TransactionLog")
+          .find({ brand })
+          .limit(5)
+          .toArray();
+        console.log("Sample TransactionLog entries before clear:", sampleLogs);
+
+        const result = await db
+          .collection("TransactionLog")
+          .deleteMany({ brand });
+
+        console.log(
+          `Cleared ${result.deletedCount} transaction logs for brand: ${brand}`
+        );
+
+        res.send({
+          message: `Cleared ${result.deletedCount} transaction logs`,
+          deletedCount: result.deletedCount,
+        });
+      } catch (err) {
+        console.error("Error clearing transaction logs:", err);
+        res.status(500).send({
+          message: "Error clearing transaction logs",
+          error: err.message,
+        });
       }
     });
 
@@ -922,11 +1263,37 @@ connectToMongoDB()
           brand,
         });
 
+        const transactionId = uuidv4();
+        const transactionLog = {
+          transactionId,
+          brand,
+          operation: "calculated-column",
+          status: "active",
+          updates: [],
+          column,
+          isNewColumn,
+          createdAt: new Date(),
+        };
+
         let modifiedCount = 0;
         for (const update of updates) {
           const { _id, value } = update;
           try {
             const objectId = new ObjectId(_id);
+            const originalRecord = await brandsDb
+              .collection(brand)
+              .findOne({ _id: objectId }, { projection: { [column]: 1 } });
+
+            const originalValue = originalRecord
+              ? originalRecord[column]
+              : null;
+
+            transactionLog.updates.push({
+              id: _id,
+              originalValues: { [column]: originalValue },
+              newValues: { [column]: value },
+            });
+
             const updateOperation = isNewColumn
               ? { $set: { [column]: value } }
               : { $set: { [column]: value } };
@@ -947,6 +1314,10 @@ connectToMongoDB()
           }
         }
 
+        // Save transaction log
+        await db.collection("TransactionLog").insertOne(transactionLog);
+        console.log("Transaction logged:", transactionId);
+
         console.log("Calculated column update result:", {
           modifiedCount,
           totalUpdates: updates.length,
@@ -956,6 +1327,7 @@ connectToMongoDB()
           return res.status(200).send({
             message: "No records were modified",
             modifiedCount,
+            transactionId,
           });
         }
 
@@ -964,11 +1336,200 @@ connectToMongoDB()
             ? `New column '${column}' added successfully`
             : `Column '${column}' updated successfully`,
           modifiedCount,
+          transactionId,
         });
       } catch (err) {
         console.error("Error processing calculated column:", err);
         res.status(500).send({
           message: "Error processing calculated column",
+          error: err.message,
+        });
+      }
+    });
+
+    // New endpoint for undo operation
+    app.post("/api/undo", async (req, res) => {
+      try {
+        const { brand } = req.body;
+        if (!brand) {
+          return res.status(400).send({ message: "Brand is required" });
+        }
+
+        // Find the most recent active transaction
+        const transaction = await db
+          .collection("TransactionLog")
+          .findOne({ brand, status: "active" }, { sort: { createdAt: -1 } });
+
+        if (!transaction) {
+          return res.status(404).send({ message: "No actions to undo" });
+        }
+
+        console.log("Undoing transaction:", transaction.transactionId);
+
+        const bulkOperations = transaction.updates
+          .map(({ id, originalValues }) => {
+            try {
+              const objectId = new ObjectId(id);
+              return {
+                updateOne: {
+                  filter: { _id: objectId },
+                  update: { $set: originalValues },
+                },
+              };
+            } catch (err) {
+              console.warn(`Invalid ObjectId for undo: ${id}`);
+              return null;
+            }
+          })
+          .filter((op) => op !== null);
+
+        if (bulkOperations.length === 0) {
+          await db
+            .collection("TransactionLog")
+            .updateOne(
+              { transactionId: transaction.transactionId },
+              { $set: { status: "undone" } }
+            );
+          return res.status(200).send({
+            message: "No valid records to undo, transaction marked as undone",
+          });
+        }
+
+        const result = await brandsDb
+          .collection(brand)
+          .bulkWrite(bulkOperations);
+
+        // Mark transaction as undone
+        await db
+          .collection("TransactionLog")
+          .updateOne(
+            { transactionId: transaction.transactionId },
+            { $set: { status: "undone" } }
+          );
+
+        console.log("Undo result:", {
+          transactionId: transaction.transactionId,
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        });
+
+        res.send({
+          message: "Undo completed",
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (err) {
+        console.error("Error performing undo:", err);
+        res.status(500).send({
+          message: "Error performing undo",
+          error: err.message,
+        });
+      }
+    });
+
+    // New endpoint for redo operation
+    app.post("/api/redo", async (req, res) => {
+      try {
+        const { brand } = req.body;
+        if (!brand) {
+          return res.status(400).send({ message: "Brand is required" });
+        }
+
+        // Find the most recent undone transaction
+        const transaction = await db
+          .collection("TransactionLog")
+          .findOne({ brand, status: "undone" }, { sort: { createdAt: -1 } });
+
+        if (!transaction) {
+          return res.status(404).send({ message: "No actions to redo" });
+        }
+
+        console.log("Redoing transaction:", transaction.transactionId);
+
+        const bulkOperations = transaction.updates
+          .map(({ id, newValues }) => {
+            try {
+              const objectId = new ObjectId(id);
+              return {
+                updateOne: {
+                  filter: { _id: objectId },
+                  update: { $set: newValues },
+                },
+              };
+            } catch (err) {
+              console.warn(`Invalid ObjectId for redo: ${id}`);
+              return null;
+            }
+          })
+          .filter((op) => op !== null);
+
+        if (bulkOperations.length === 0) {
+          await db
+            .collection("TransactionLog")
+            .updateOne(
+              { transactionId: transaction.transactionId },
+              { $set: { status: "active" } }
+            );
+          return res.status(200).send({
+            message: "No valid records to redo, transaction marked as active",
+          });
+        }
+
+        const result = await brandsDb
+          .collection(brand)
+          .bulkWrite(bulkOperations);
+
+        // Mark transaction as active
+        await db
+          .collection("TransactionLog")
+          .updateOne(
+            { transactionId: transaction.transactionId },
+            { $set: { status: "active" } }
+          );
+
+        console.log("Redo result:", {
+          transactionId: transaction.transactionId,
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        });
+
+        res.send({
+          message: "Redo completed",
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+        });
+      } catch (err) {
+        console.error("Error performing redo:", err);
+        res.status(500).send({
+          message: "Error performing redo",
+          error: err.message,
+        });
+      }
+    });
+
+    app.post("/api/check-transactions", async (req, res) => {
+      try {
+        const { brand } = req.body;
+        if (!brand) {
+          return res.status(400).send({ message: "Brand is required" });
+        }
+
+        const canUndo = await db
+          .collection("TransactionLog")
+          .findOne({ brand, status: "active" }, { sort: { createdAt: -1 } });
+
+        const canRedo = await db
+          .collection("TransactionLog")
+          .findOne({ brand, status: "undone" }, { sort: { createdAt: -1 } });
+
+        res.send({
+          canUndo: !!canUndo,
+          canRedo: !!canRedo,
+        });
+      } catch (err) {
+        console.error("Error checking transactions:", err);
+        res.status(500).send({
+          message: "Error checking transactions",
           error: err.message,
         });
       }
