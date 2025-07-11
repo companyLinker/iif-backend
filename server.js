@@ -160,11 +160,22 @@ function cleanObjectForBMData(obj) {
 
     if (typeof value === "string") {
       value = value.trim().replace(/\x00/g, "");
+      // Explicitly treat 'Storeno_' as a string, not a date
+      if (cleanKey.toLowerCase() === "storeno_") {
+        acc[cleanKey] = value;
+        return acc;
+      }
     } else if (value instanceof Date) {
       value = moment(value).format("MM-DD-YYYY");
     } else if (typeof value === "number" && !isNaN(value)) {
-      const date = new Date((value - 25569) * 86400 * 1000);
-      value = moment(date).format("MM-DD-YYYY");
+      // Only convert numbers to dates if they are in Excel serial date format
+      // and the key is explicitly 'Date'
+      if (cleanKey.toLowerCase() === "date") {
+        const date = new Date((value - 25569) * 86400 * 1000);
+        value = moment(date).format("MM-DD-YYYY");
+      } else {
+        value = value.toString(); // Treat other numbers as strings
+      }
     }
 
     acc[cleanKey] = value;
@@ -872,19 +883,25 @@ connectToMongoDB()
           return res.send(data);
         }
 
-        const finalColumns = [];
-        if (data[0].hasOwnProperty("StoreName")) finalColumns.push("StoreName");
-        if (data[0].hasOwnProperty("Date")) finalColumns.push("Date");
-        const allColumns = Object.keys(data[0] || {}).filter(
-          (col) => col !== "_id" && !finalColumns.includes(col)
-        );
-        finalColumns.push(...allColumns);
+        // Collect all unique columns across all documents
+        const allColumns = Array.from(
+          new Set(data.flatMap((record) => Object.keys(record)))
+        ).filter((col) => col !== "_id");
+
+        // Define priority columns to appear first
+        const priorityColumns = ["StoreName", "Date"];
+        const finalColumns = [
+          ...priorityColumns.filter((col) => allColumns.includes(col)),
+          ...allColumns.filter((col) => !priorityColumns.includes(col)),
+        ];
 
         const normalizedData = data.map((record) => {
           const normalizedRecord = { _id: record._id.toString() };
           finalColumns.forEach((col) => {
             normalizedRecord[col] =
-              record[col] !== undefined ? record[col] : null;
+              record[col] !== undefined && record[col] !== null
+                ? record[col]
+                : null;
           });
           return normalizedRecord;
         });
@@ -1636,23 +1653,25 @@ connectToMongoDB()
           return res.send([]);
         }
 
-        const finalColumns = ["_id", "store_name", "mapped_col_name"];
-        const allColumns = Object.keys(data[0] || {}).filter(
-          (col) =>
-            col !== "_id" &&
-            col !== "store_name" &&
-            col !== "mapped_col_name" &&
-            !finalColumns.includes(col)
-        );
-        finalColumns.push(...allColumns);
+        // Dynamically collect all unique columns from the data
+        const allColumns = Array.from(
+          new Set(data.flatMap((record) => Object.keys(record)))
+        ).filter((col) => col !== "_id");
+
+        // Ensure 'store_name' and 'mapped_col_name' appear first, if present
+        const priorityColumns = ["store_name", "mapped_col_name"];
+        const finalColumns = [
+          ...priorityColumns.filter((col) => allColumns.includes(col)),
+          ...allColumns.filter(
+            (col) => !priorityColumns.includes(col) && col !== "_id"
+          ),
+        ];
 
         const normalizedData = data.map((record) => {
           const normalizedRecord = { _id: record._id.toString() };
           finalColumns.forEach((col) => {
-            if (col !== "_id") {
-              normalizedRecord[col] =
-                record[col] !== undefined ? record[col] : null;
-            }
+            normalizedRecord[col] =
+              record[col] !== undefined ? record[col] : null;
           });
           return normalizedRecord;
         });
