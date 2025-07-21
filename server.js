@@ -93,9 +93,13 @@ function cleanObjectForSampleData(obj) {
       if (cleanKey.toLowerCase() !== "date") {
         const parsedNumber = parseFloat(value.replace(/[^0-9.-]/g, ""));
         if (!isNaN(parsedNumber) && value.match(/^-?\d*\.?\d*$/)) {
-          value = parsedNumber;
+          // Round to two decimal places for numeric strings
+          value = Number(parsedNumber.toFixed(2));
         }
       }
+    } else if (typeof value === "number" && !isNaN(value)) {
+      // Round numbers to two decimal places
+      value = Number(value.toFixed(2));
     } else if (value === null || value === undefined) {
       value = null;
     }
