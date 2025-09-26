@@ -62,7 +62,7 @@ async function connectToMongoDB() {
     console.log("Connected to MongoDB");
     await db.collection("SampleData").createIndex({ Date: 1 });
     await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
-    await db.collection("BMData").createIndex({ store_name: 1 });
+    await db.collection("BMData").createIndex({ Name: 1 });
     await db.collection("Formats").createIndex({ name: 1 }, { unique: true });
     await db
       .collection("Formulas")
@@ -165,7 +165,7 @@ function cleanObjectForBMData(obj) {
     if (typeof value === "string") {
       value = value.trim().replace(/\x00/g, "");
       // Explicitly treat 'Storeno_' as a string, not a date
-      if (cleanKey.toLowerCase() === "storeno_") {
+      if (cleanKey.toLowerCase() === "storno") {
         acc[cleanKey] = value;
         return acc;
       }
@@ -219,52 +219,53 @@ connectToMongoDB()
 
         const { state, brand } = req.query;
         const matchQuery = {};
-        if (state) {
+        if (state)
           matchQuery.State = Array.isArray(state) ? { $in: state } : state;
-        }
-        if (brand) {
-          matchQuery.BRAND = Array.isArray(brand) ? { $in: brand } : brand;
-        }
+        if (brand)
+          matchQuery.Brand = Array.isArray(brand) ? { $in: brand } : brand;
 
         const states = await db
           .collection("BMData")
           .distinct("State", { State: { $ne: null } });
-
         const brands = await db
           .collection("BMData")
-          .distinct("BRAND", { BRAND: { $ne: null } });
+          .distinct("Brand", { Brand: { $ne: null } });
 
         const storeMappings = await db
           .collection("BMData")
           .find(
             {
               ...matchQuery,
-              POS_COMPANY_NAME: { $ne: null },
+              Name: { $ne: null },
             },
             {
               projection: {
-                POS_COMPANY_NAME: 1,
+                Name: 1,
                 State: 1,
-                BRAND: 1,
-                mapped_col_name: 1,
+                Brand: 1,
+                BankCOA: 1,
+                StoreNo: 1,
+                storeno: 1,
+                Store_No: 1,
                 _id: 0,
               },
             }
           )
+          .map((doc) => ({
+            ...doc,
+            StoreNo: doc.StoreNo || doc.storeno || doc.Store_No || "", // Normalize StoreNo
+          }))
           .toArray();
 
         console.log("Fetched filter options:", {
           stateCount: states.length,
           brandCount: brands.length,
           storeMappingCount: storeMappings.length,
+          sampleStoreMappings: storeMappings.slice(0, 2),
           query: { state, brand },
         });
 
-        res.send({
-          states,
-          brands,
-          storeMappings,
-        });
+        res.send({ states, brands, storeMappings });
       } catch (err) {
         console.error("Error fetching filter options:", err);
         res.status(500).send({ message: "Error fetching filter options" });
@@ -1571,22 +1572,47 @@ connectToMongoDB()
             .pop()
             .toLowerCase();
           let data = [];
+          let headers = []; // Store the header order
 
           if (fileExtension === "csv") {
             await new Promise((resolve, reject) => {
+              const results = [];
               fs.createReadStream(filePath)
                 .pipe(csv())
+                .on("headers", (headerList) => {
+                  headers = headerList.map((header) =>
+                    header.trim().replace(/\s+/g, "").replace(/\./g, "_")
+                  ); // Capture and clean headers
+                  console.log("CSV headers:", headers); // Debug: Log header order
+                })
                 .on("data", (row) => {
-                  data.push(cleanObjectForBMData(row));
+                  results.push(cleanObjectForBMData(row));
                 })
                 .on("end", resolve)
                 .on("error", reject);
+              data = results;
             });
           } else if (fileExtension === "xlsx" || fileExtension === "xls") {
             const workbook = XLSX.readFile(filePath);
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const rawData = XLSX.utils.sheet_to_json(sheet);
-            data = rawData.map(cleanObjectForBMData);
+            const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+            headers = rawData[0].map((header) =>
+              header
+                ? header
+                    .toString()
+                    .trim()
+                    .replace(/\s+/g, "")
+                    .replace(/\./g, "_")
+                : ""
+            ); // Capture and clean headers
+            console.log("Excel headers:", headers); // Debug: Log header order
+            data = rawData.slice(1).map((row) => {
+              const rowData = {};
+              headers.forEach((header, index) => {
+                rowData[header] = row[index] !== undefined ? row[index] : null;
+              });
+              return cleanObjectForBMData(rowData);
+            });
           } else {
             return res.status(400).send({ message: "Invalid file format" });
           }
@@ -1599,12 +1625,28 @@ connectToMongoDB()
           }
 
           console.log("Sample bank mapping data:", data.slice(0, 2));
+
+          // Clear existing data in BMData collection
+          await db.collection("BMData").deleteMany({});
+          console.log("Cleared existing BMData collection");
+
+          // Insert new data
           const result = await db.collection("BMData").insertMany(data);
           console.log(
             "Insert result for BMData:",
             result.insertedCount,
             "documents"
           );
+
+          // Store the header order in a separate collection or document
+          await db
+            .collection("BMDataHeaders")
+            .updateOne(
+              { _id: "headerOrder" },
+              { $set: { headers } },
+              { upsert: true }
+            );
+          console.log("Stored header order:", headers);
 
           await fs.unlink(filePath);
           res.send({
@@ -1638,8 +1680,8 @@ connectToMongoDB()
             {
               $match: {
                 ...(state.length > 0 && { State: { $in: state } }),
-                ...(posName.length > 0 && { POSNAME: { $in: posName } }),
-                ...(brand.length > 0 && { BRAND: { $in: brand } }),
+                ...(posName.length > 0 && { Name: { $in: posName } }),
+                ...(brand.length > 0 && { Brand: { $in: brand } }),
               },
             },
           ])
@@ -1657,23 +1699,23 @@ connectToMongoDB()
           return res.send([]);
         }
 
-        // Dynamically collect all unique columns from the data
-        const allColumns = Array.from(
-          new Set(data.flatMap((record) => Object.keys(record)))
-        ).filter((col) => col !== "_id");
+        // Retrieve stored header order
+        const headerDoc = await db
+          .collection("BMDataHeaders")
+          .findOne({ _id: "headerOrder" });
+        const headers = headerDoc ? headerDoc.headers : [];
+        console.log("Retrieved header order:", headers);
 
-        // Ensure 'store_name' and 'mapped_col_name' appear first, if present
-        const priorityColumns = ["store_name", "mapped_col_name"];
-        const finalColumns = [
-          ...priorityColumns.filter((col) => allColumns.includes(col)),
-          ...allColumns.filter(
-            (col) => !priorityColumns.includes(col) && col !== "_id"
-          ),
-        ];
+        // If no headers are stored, fall back to the first document's keys
+        const allColumns =
+          headers.length > 0
+            ? headers
+            : Object.keys(data[0]).filter((col) => col !== "_id");
+        console.log("Final column order:", allColumns);
 
         const normalizedData = data.map((record) => {
           const normalizedRecord = { _id: record._id.toString() };
-          finalColumns.forEach((col) => {
+          allColumns.forEach((col) => {
             normalizedRecord[col] =
               record[col] !== undefined ? record[col] : null;
           });
@@ -1699,18 +1741,297 @@ connectToMongoDB()
         }
 
         console.log("Received IDs for deletion:", ids);
-        const objectIds = ids.map((id) => new ObjectId(id));
+        const objectIds = ids
+          .map((id) => {
+            try {
+              return new ObjectId(id);
+            } catch (err) {
+              console.warn(`Invalid ObjectId skipped: ${id}`);
+              return null;
+            }
+          })
+          .filter((id) => id !== null);
+
+        if (objectIds.length === 0) {
+          return res
+            .status(400)
+            .send({ message: "No valid ObjectIds provided" });
+        }
+
         const result = await db
           .collection("BMData")
           .deleteMany({ _id: { $in: objectIds } });
-        console.log("Delete result:", result);
+        console.log("Delete result:", {
+          deletedCount: result.deletedCount,
+          deletedIds: ids,
+        });
         res.send({
           message: "Data deleted successfully",
           deletedCount: result.deletedCount,
         });
       } catch (err) {
         console.error("Error deleting data:", err);
-        res.status(500).send({ message: "Error deleting data" });
+        res
+          .status(500)
+          .send({ message: "Error deleting data", error: err.message });
+      }
+    });
+
+    // Endpoint to upload StoreData
+    app.post(
+      "/api/store-data-upload",
+      upload.single("file"),
+      async (req, res) => {
+        try {
+          if (!req.file) {
+            return res.status(400).send({ message: "No file uploaded" });
+          }
+
+          const filePath = req.file.path;
+          const fileExtension = req.file.originalname
+            .split(".")
+            .pop()
+            .toLowerCase();
+          let data = [];
+
+          if (fileExtension === "csv") {
+            await new Promise((resolve, reject) => {
+              fs.createReadStream(filePath)
+                .pipe(csv())
+                .on("data", (row) => {
+                  data.push(cleanObjectForBMData(row)); // Reusing cleanObjectForBMData for consistency
+                })
+                .on("end", resolve)
+                .on("error", reject);
+            });
+          } else if (fileExtension === "xlsx" || fileExtension === "xls") {
+            const workbook = XLSX.readFile(filePath);
+            const sheet = workbook.Sheets[workbook.SheetNames[0]];
+            const rawData = XLSX.utils.sheet_to_json(sheet);
+            data = rawData.map(cleanObjectForBMData);
+          } else {
+            return res.status(400).send({ message: "Invalid file format" });
+          }
+
+          if (data.length === 0) {
+            console.warn("No data processed from file:", filePath);
+            return res
+              .status(400)
+              .send({ message: "No valid data found in file" });
+          }
+
+          console.log("Sample store data:", data.slice(0, 2));
+          const result = await db.collection("StoreData").insertMany(data);
+          console.log(
+            "Insert result for StoreData:",
+            result.insertedCount,
+            "documents"
+          );
+
+          await fs.unlink(filePath);
+          res.send({
+            message: "Store data uploaded successfully",
+            insertedCount: result.insertedCount,
+          });
+        } catch (err) {
+          console.error("Store data upload error:", err);
+          res.status(500).send({
+            message: "Error uploading store data file",
+            error: err.message,
+          });
+        }
+      }
+    );
+
+    // Endpoint to fetch StoreData
+    app.post("/api/store-data", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db)
+            return res.status(503).send({ message: "Database not connected" });
+        }
+
+        const data = await db.collection("StoreData").find({}).toArray();
+
+        console.log("Found store data records:", data.length);
+
+        if (data.length === 0) {
+          const sample = await db
+            .collection("StoreData")
+            .find()
+            .limit(5)
+            .toArray();
+          console.log("Sample store data in DB:", sample);
+          return res.send({ storeData: [] });
+        }
+
+        // Dynamically collect all unique columns from the data
+        const allColumns = Array.from(
+          new Set(data.flatMap((record) => Object.keys(record)))
+        ).filter((col) => col !== "_id");
+
+        // Ensure 'NAME' and 'NO' appear first, if present
+        const priorityColumns = ["NAME", "NO"];
+        const finalColumns = [
+          ...priorityColumns.filter((col) => allColumns.includes(col)),
+          ...allColumns.filter(
+            (col) => !priorityColumns.includes(col) && col !== "_id"
+          ),
+        ];
+
+        const normalizedData = data.map((record) => {
+          const normalizedRecord = { _id: record._id.toString() };
+          finalColumns.forEach((col) => {
+            normalizedRecord[col] =
+              record[col] !== undefined ? record[col] : null;
+          });
+          return normalizedRecord;
+        });
+
+        console.log(
+          "Normalized store data sample:",
+          normalizedData.slice(0, 2)
+        );
+        res.send({ storeData: normalizedData }); // Wrap the response in storeData
+      } catch (err) {
+        console.error("Error fetching store data:", err);
+        res.status(500).send({ message: "Error fetching store data" });
+      }
+    });
+
+    // Endpoint to delete StoreData
+    app.post("/api/store-data-delete", async (req, res) => {
+      try {
+        const { ids } = req.body;
+        if (!ids || !Array.isArray(ids) || ids.length === 0) {
+          return res.status(400).send({ message: "No valid IDs provided" });
+        }
+
+        console.log("Received IDs for deletion:", ids);
+        const objectIds = ids
+          .map((id) => {
+            try {
+              return new ObjectId(id);
+            } catch (err) {
+              console.warn(`Invalid ObjectId skipped: ${id}`);
+              return null;
+            }
+          })
+          .filter((id) => id !== null);
+
+        if (objectIds.length === 0) {
+          return res
+            .status(400)
+            .send({ message: "No valid ObjectIds provided" });
+        }
+
+        const result = await db
+          .collection("StoreData")
+          .deleteMany({ _id: { $in: objectIds } });
+        console.log("Delete result:", {
+          deletedCount: result.deletedCount,
+          deletedIds: ids,
+        });
+        res.send({
+          message: "Data deleted successfully",
+          deletedCount: result.deletedCount,
+        });
+      } catch (err) {
+        console.error("Error deleting store data:", err);
+        res.status(500).send({
+          message: "Error deleting store data",
+          error: err.message,
+        });
+      }
+    });
+
+    // Endpoint to add new StoreData
+    app.post("/api/store-data-add", async (req, res) => {
+      try {
+        const { data } = req.body;
+        if (!data || typeof data !== "object") {
+          return res.status(400).send({ message: "Invalid data provided" });
+        }
+
+        const cleanedData = cleanObjectForBMData(data);
+        if (Object.keys(cleanedData).length === 0) {
+          return res.status(400).send({ message: "No valid data to insert" });
+        }
+
+        console.log("Adding new store data:", cleanedData);
+        const result = await db.collection("StoreData").insertOne(cleanedData);
+
+        console.log("Insert result:", {
+          insertedId: result.insertedId,
+          insertedCount: result.insertedCount,
+        });
+
+        res.send({
+          message: "New store data added successfully",
+          insertedId: result.insertedId.toString(),
+        });
+      } catch (err) {
+        console.error("Error adding store data:", err);
+        res.status(500).send({
+          message: "Error adding store data",
+          error: err.message,
+        });
+      }
+    });
+
+    // Endpoint to update StoreData
+    app.post("/api/store-data-update", async (req, res) => {
+      try {
+        const { id, updates } = req.body;
+        if (!id || !updates) {
+          return res.status(400).send({ message: "Invalid update request" });
+        }
+
+        const cleanedUpdates = cleanObjectForBMData(updates);
+        const result = await db
+          .collection("StoreData")
+          .updateOne({ _id: new ObjectId(id) }, { $set: cleanedUpdates });
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "Record not found" });
+        }
+        res.send({ message: "Data updated successfully" });
+      } catch (err) {
+        console.error("Error updating store data:", err);
+        res.status(500).send({ message: "Error updating store data" });
+      }
+    });
+
+    app.post("/api/bank-mapping-add", async (req, res) => {
+      try {
+        const { data } = req.body;
+        if (!data || typeof data !== "object") {
+          return res.status(400).send({ message: "Invalid data provided" });
+        }
+
+        const cleanedData = cleanObjectForBMData(data);
+        if (Object.keys(cleanedData).length === 0) {
+          return res.status(400).send({ message: "No valid data to insert" });
+        }
+
+        console.log("Adding new bank mapping data:", cleanedData);
+        const result = await db.collection("BMData").insertOne(cleanedData);
+
+        console.log("Insert result:", {
+          insertedId: result.insertedId,
+          insertedCount: result.insertedCount,
+        });
+
+        res.send({
+          message: "New bank mapping data added successfully",
+          insertedId: result.insertedId.toString(),
+        });
+      } catch (err) {
+        console.error("Error adding bank mapping data:", err);
+        res.status(500).send({
+          message: "Error adding bank mapping data",
+          error: err.message,
+        });
       }
     });
 
@@ -1732,6 +2053,37 @@ connectToMongoDB()
       } catch (err) {
         console.error("Error updating data:", err);
         res.status(500).send({ message: "Error updating data" });
+      }
+    });
+
+    app.get("/api/store-data", async (req, res) => {
+      try {
+        if (!db) {
+          await connectToMongoDB();
+          if (!db) throw new Error("Failed to connect to MongoDB");
+        }
+
+        const storeData = await db
+          .collection("StoreData")
+          .find(
+            {},
+            {
+              projection: {
+                NAME: 1,
+                NO: 1,
+                _id: 0,
+              },
+            }
+          )
+          .toArray();
+
+        console.log(`Retrieved ${storeData.length} store data records`);
+        res.send({ storeData });
+      } catch (err) {
+        console.error("Error fetching store data:", err);
+        res
+          .status(500)
+          .send({ message: "Error fetching store data", error: err.message });
       }
     });
 
