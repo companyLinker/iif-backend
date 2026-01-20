@@ -7,6 +7,8 @@ import XLSX from "xlsx";
 import moment from "moment";
 import { evaluate } from "mathjs";
 import { v4 as uuidv4 } from "uuid";
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
 app.use(express.json());
@@ -17,7 +19,7 @@ app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept"
+    "Origin, X-Requested-With, Content-Type, Accept",
   );
   if (req.method === "OPTIONS") {
     res.header("Access-Control-Allow-Methods", "PUT, POST, PATCH, DELETE, GET");
@@ -26,8 +28,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const mongoUrl =
-  "mongodb+srv://krushant:kK58jbHcl5taHmNb@transactions-cluster.bkfz4.mongodb.net/?retryWrites=true&w=majority&appName=transactions-cluster";
+const mongoUrl = process.env.VITE_MONGO_URL;
 const dbName = "transactionsDB";
 const brandsDbName = "brandsDB";
 
@@ -53,13 +54,29 @@ let mongoClient;
 
 async function connectToMongoDB() {
   try {
-    const client = await MongoClient.connect(mongoUrl, {
+    // 1. Check if we already have a valid connection
+    if (
+      mongoClient &&
+      mongoClient.topology &&
+      mongoClient.topology.isConnected()
+    ) {
+      // Ensure db references are set even if client persists
+      if (!db) db = mongoClient.db(dbName);
+      if (!brandsDb) brandsDb = mongoClient.db(brandsDbName);
+      return mongoClient;
+    }
+
+    // 2. Create new connection with pool settings
+    mongoClient = await MongoClient.connect(mongoUrl, {
       connectTimeoutMS: 30000,
       socketTimeoutMS: 30000,
+      maxPoolSize: 50, // Allow up to 50 concurrent connections
     });
-    db = client.db(dbName);
-    brandsDb = client.db(brandsDbName);
-    console.log("Connected to MongoDB");
+
+    db = mongoClient.db(dbName);
+    brandsDb = mongoClient.db(brandsDbName);
+
+    // 3. Initialize Indexes (Idempotent - safe to run multiple times)
     await db.collection("SampleData").createIndex({ Date: 1 });
     await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
     await db.collection("BMData").createIndex({ Name: 1 });
@@ -67,22 +84,21 @@ async function connectToMongoDB() {
     await db
       .collection("Formulas")
       .createIndex({ formula: 1, column: 1, brand: 1 }, { unique: true });
-    return client;
+
+    return mongoClient;
   } catch (err) {
     console.error("Error connecting to MongoDB:", {
       message: err.message,
       stack: err.stack,
     });
+    // Force reset if connection failed
+    mongoClient = null;
     throw err;
   }
 }
 
 // Clean column names and values for SampleData
 function cleanObjectForSampleData(obj) {
-  console.log("Processing columns and sample values:", {
-    columns: Object.keys(obj),
-    sample: obj,
-  });
   return Object.keys(obj).reduce((acc, key) => {
     // Replace dots with underscores and remove extra spaces
     const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
@@ -110,7 +126,6 @@ function cleanObjectForSampleData(obj) {
         const utcDate = new Date(excelEpoch.getTime() + (value - 1) * 86400000);
         value = moment.utc(utcDate).format("MM-DD-YYYY");
       } else if (value) {
-        console.log(`Raw date value: "${value}"`);
         const parsedDate = moment(
           String(value),
           [
@@ -123,12 +138,11 @@ function cleanObjectForSampleData(obj) {
             "MM-DD-YY",
             "M-D-YYYY",
           ],
-          true
+          true,
         );
         if (parsedDate.isValid()) {
           value = parsedDate.format("MM-DD-YYYY");
         } else {
-          console.log(`Failed to parse date: "${value}"`);
           value = null;
         }
       }
@@ -150,7 +164,6 @@ async function initializeTransactionLog() {
     await db
       .collection("TransactionLog")
       .createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // 30 days TTL
-    console.log("TransactionLog collection initialized");
   } catch (err) {
     console.error("Error initializing TransactionLog:", err);
   }
@@ -249,21 +262,13 @@ connectToMongoDB()
                 Store_No: 1,
                 _id: 0,
               },
-            }
+            },
           )
           .map((doc) => ({
             ...doc,
             StoreNo: doc.StoreNo || doc.storeno || doc.Store_No || "", // Normalize StoreNo
           }))
           .toArray();
-
-        console.log("Fetched filter options:", {
-          stateCount: states.length,
-          brandCount: brands.length,
-          storeMappingCount: storeMappings.length,
-          sampleStoreMappings: storeMappings.slice(0, 2),
-          query: { state, brand },
-        });
 
         res.send({ states, brands, storeMappings });
       } catch (err) {
@@ -279,12 +284,11 @@ connectToMongoDB()
           if (!db) throw new Error("Failed to connect to MongoDB");
         }
         const formulas = await db.collection("Formulas").find({}).toArray();
-        console.log(`Retrieved ${formulas.length} formulas`);
         res.status(200).send(
           formulas.map((formula) => ({
             ...formula,
             _id: formula._id.toString(),
-          }))
+          })),
         );
       } catch (err) {
         console.error("Error retrieving formulas:", err);
@@ -308,14 +312,12 @@ connectToMongoDB()
             .send({ message: "Formula, column, and brand are required" });
         }
 
-        console.log("Creating formula:", { formula, column, selected, brand });
-
         if (selected) {
           await db
             .collection("Formulas")
             .updateMany(
               { brand, selected: true },
-              { $set: { selected: false } }
+              { $set: { selected: false } },
             );
         }
 
@@ -327,7 +329,6 @@ connectToMongoDB()
           createdAt: new Date(),
         });
 
-        console.log("Formula created:", result.insertedId);
         res.status(201).send({
           _id: result.insertedId.toString(),
           formula,
@@ -359,8 +360,6 @@ connectToMongoDB()
         const formulaId = req.params.id;
         const { selected } = req.body;
 
-        console.log(`Toggling formula ID: ${formulaId}, selected: ${selected}`);
-
         let updateResult;
         if (selected) {
           const formula = await db
@@ -375,20 +374,20 @@ connectToMongoDB()
               selected: true,
               _id: { $ne: new ObjectId(formulaId) },
             },
-            { $set: { selected: false } }
+            { $set: { selected: false } },
           );
           updateResult = await db
             .collection("Formulas")
             .updateOne(
               { _id: new ObjectId(formulaId) },
-              { $set: { selected: true } }
+              { $set: { selected: true } },
             );
         } else {
           updateResult = await db
             .collection("Formulas")
             .updateOne(
               { _id: new ObjectId(formulaId) },
-              { $set: { selected: false } }
+              { $set: { selected: false } },
             );
         }
 
@@ -420,12 +419,11 @@ connectToMongoDB()
         }
 
         const formats = await db.collection("Formats").find({}).toArray();
-        console.log(`Retrieved ${formats.length} formats`);
         res.status(200).send(
           formats.map((format) => ({
             ...format,
             _id: format._id.toString(),
-          }))
+          })),
         );
       } catch (err) {
         console.error("Error retrieving formats:", err.message);
@@ -446,11 +444,6 @@ connectToMongoDB()
         if (!formatData.name) {
           return res.status(400).send({ message: "Format name is required" });
         }
-
-        console.log("Received format data:", {
-          name: formatData.name,
-          fields: Object.keys(formatData),
-        });
 
         const validFields = [
           "name",
@@ -501,7 +494,7 @@ connectToMongoDB()
                 ["Formula", "Answer"].includes(col.calculationType)
                   ? col.calculationType
                   : "Answer",
-            })
+            }),
           );
         } else {
           cleanedFormat.calculatedColumns = [];
@@ -515,9 +508,6 @@ connectToMongoDB()
           const result = await db
             .collection("Formats")
             .insertOne(cleanedFormat);
-          console.log(
-            `Created format: ${cleanedFormat.name}, ID: ${result.insertedId}`
-          );
 
           const createdFormat = await db
             .collection("Formats")
@@ -560,8 +550,6 @@ connectToMongoDB()
         if (!formatData.name) {
           return res.status(400).send({ message: "Format name is required" });
         }
-
-        console.log(`Updating format ID: ${formatId}, Data:`, formatData.name);
 
         const validFields = [
           "name",
@@ -625,7 +613,7 @@ connectToMongoDB()
             .collection("Formats")
             .updateOne(
               { _id: new ObjectId(formatId) },
-              { $set: cleanedFormatData }
+              { $set: cleanedFormatData },
             );
 
           if (result.matchedCount === 0) {
@@ -633,9 +621,6 @@ connectToMongoDB()
             return res.status(404).send({ message: "Format not found" });
           }
 
-          console.log(
-            `Updated format ID: ${formatId}, Name: ${cleanedFormatData.name}`
-          );
           const updatedFormat = await db
             .collection("Formats")
             .findOne({ _id: new ObjectId(formatId) });
@@ -675,20 +660,33 @@ connectToMongoDB()
           return res.status(400).send({ message: "Brand is required" });
         }
 
+        // Ensure DB is connected
+        if (!brandsDb) await connectToMongoDB();
+
+        // Create index for the brand collection if it doesn't exist
+        // This speeds up the duplicate check query significantly
+        await brandsDb.collection(brand).createIndex({ StoreName: 1, Date: 1 });
+
         let totalInserted = 0;
         let totalDuplicates = 0;
         let totalSheets = 0;
 
-        const filePromises = req.files.map(async (file) => {
+        // BATCH SIZE: Process 1000 rows at a time to prevent Timeouts/Memory crashes
+        const BATCH_SIZE = 1000;
+
+        // Process files SEQUENTIALLY to save memory (using for...of instead of map/Promise.all)
+        for (const file of req.files) {
           const filePath = file.path;
           const fileExtension = file.originalname
             .split(".")
             .pop()
             .toLowerCase();
-          let data = [];
-          let sheetCount = 1;
+
+          let fileData = [];
+          let sheetCount = 0;
 
           try {
+            // --- Parsing Logic (Kept existing logic) ---
             if (fileExtension === "csv") {
               await new Promise((resolve, reject) => {
                 const results = [];
@@ -701,7 +699,8 @@ connectToMongoDB()
                     }
                   })
                   .on("end", () => {
-                    data = results;
+                    fileData = results;
+                    sheetCount = 1;
                     resolve();
                   })
                   .on("error", reject);
@@ -719,96 +718,93 @@ connectToMongoDB()
                 const sheetData = rawData
                   .map(cleanObjectForSampleData)
                   .filter((row) => Object.keys(row).length > 0);
-                console.log(
-                  `Processed sheet: ${sheetName}, Rows: ${sheetData.length}`
-                );
-                data = data.concat(sheetData);
+
+                fileData = fileData.concat(sheetData);
               }
             } else {
               throw new Error("Invalid file format");
             }
 
-            if (data.length === 0) {
+            if (fileData.length === 0) {
               console.warn("No data processed from file:", filePath);
-              return { insertedCount: 0, duplicateCount: 0, sheetCount };
+              continue; // Skip to next file
             }
 
-            const keys = data
-              .filter((record) => record.StoreName && record.Date)
-              .map((record) => ({
-                StoreName: record.StoreName,
-                Date: record.Date,
-              }));
+            // --- BATCH PROCESSING START ---
+            // We split the large fileData into smaller chunks
+            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
+              const batch = fileData.slice(i, i + BATCH_SIZE);
 
-            const existingRecords = await brandsDb
-              .collection(brand)
-              .find({
-                $or: keys,
-              })
-              .project({ StoreName: 1, Date: 1 })
-              .toArray();
+              // 1. Prepare keys for duplicate check
+              const keys = batch
+                .filter((record) => record.StoreName && record.Date)
+                .map((record) => ({
+                  StoreName: record.StoreName,
+                  Date: record.Date,
+                }));
 
-            const existingKeys = new Set(
-              existingRecords.map((r) => `${r.StoreName}|${r.Date}`)
-            );
+              if (keys.length === 0) continue;
 
-            const recordsToInsert = data.filter((record) => {
-              if (!record.StoreName || !record.Date) {
-                console.warn(
-                  "Skipping record missing StoreName or Date:",
-                  record
-                );
-                return false;
-              }
-              const key = `${record.StoreName}|${record.Date}`;
-              return !existingKeys.has(key);
-            });
-
-            let insertedCount = 0;
-            let duplicateCount = data.length - recordsToInsert.length;
-
-            if (recordsToInsert.length > 0) {
-              const result = await brandsDb
+              // 2. Find existing records ONLY for this batch
+              const existingRecords = await brandsDb
                 .collection(brand)
-                .insertMany(recordsToInsert, { ordered: false });
-              insertedCount = result.insertedCount;
-              console.log(
-                `Insert result for file ${file.originalname}:`,
-                insertedCount,
-                "documents"
-              );
-            }
+                .find({ $or: keys })
+                .project({ StoreName: 1, Date: 1 })
+                .toArray();
 
-            return { insertedCount, duplicateCount, sheetCount };
+              const existingKeys = new Set(
+                existingRecords.map((r) => `${r.StoreName}|${r.Date}`),
+              );
+
+              // 3. Filter duplicates
+              const recordsToInsert = batch.filter((record) => {
+                if (!record.StoreName || !record.Date) return false;
+                const key = `${record.StoreName}|${record.Date}`;
+                return !existingKeys.has(key);
+              });
+
+              // 4. Insert Batch
+              if (recordsToInsert.length > 0) {
+                const result = await brandsDb
+                  .collection(brand)
+                  .insertMany(recordsToInsert, { ordered: false });
+                totalInserted += result.insertedCount;
+              }
+
+              totalDuplicates += batch.length - recordsToInsert.length;
+
+              // Small pause to allow Node event loop to handle other requests (prevents blocking)
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+            // --- BATCH PROCESSING END ---
+
+            totalSheets += sheetCount;
+          } catch (err) {
+            console.error(`Error processing file ${file.originalname}:`, err);
+            // Optionally continue to next file or throw
           } finally {
+            // Clean up uploaded file
             await fs
               .unlink(filePath)
               .catch((err) =>
-                console.error(`Failed to delete file ${filePath}:`, err)
+                console.error(`Failed to delete file ${filePath}:`, err),
               );
           }
-        });
-
-        const results = await Promise.all(filePromises);
-
-        totalInserted = results.reduce((sum, r) => sum + r.insertedCount, 0);
-        totalDuplicates = results.reduce((sum, r) => sum + r.duplicateCount, 0);
-        totalSheets = results.reduce((sum, r) => sum + r.sheetCount, 0);
+        }
 
         const response = {
           message:
             totalInserted > 0
               ? "Data uploaded successfully"
               : totalDuplicates > 0
-              ? "No new data uploaded; all records were duplicates"
-              : "No valid data to insert",
+                ? "No new data uploaded; all records were duplicates"
+                : "No valid data to insert",
           insertedCount: totalInserted,
           duplicateCount: totalDuplicates,
           sheetCount: totalSheets,
           fileCount: req.files.length,
         };
 
-        console.log("Upload response:", response);
         res.send(response);
       } catch (err) {
         console.error("Upload error:", err);
@@ -832,19 +828,15 @@ connectToMongoDB()
             .send({ message: "Start date, end date, and brand are required" });
         }
 
-        console.log("Incoming startDate:", startDate);
-        console.log("Incoming endDate:", endDate);
-        console.log("Brand:", brand);
-
         const start = moment(
           startDate,
           ["MM-DD-YYYY", "M/D/YYYY", "MM/DD/YYYY", "YYYY-MM-DD", "M-D-YYYY"],
-          true
+          true,
         );
         const end = moment(
           endDate,
           ["MM-DD-YYYY", "M/D/YYYY", "MM/DD/YYYY", "YYYY-MM-DD", "M-D-YYYY"],
-          true
+          true,
         );
 
         if (!start.isValid() || !end.isValid()) {
@@ -856,9 +848,6 @@ connectToMongoDB()
         const formattedStartDate = start.format("MM-DD-YYYY");
         const formattedEndDate = end.format("MM-DD-YYYY");
 
-        console.log("Querying with formatted startDate:", formattedStartDate);
-        console.log("Querying with formatted endDate:", formattedEndDate);
-
         const data = await brandsDb
           .collection(brand)
           .find({
@@ -869,28 +858,18 @@ connectToMongoDB()
           })
           .toArray();
 
-        console.log(
-          "Found records for brand:",
-          brand,
-          "Count:",
-          data.length,
-          "Sample:",
-          data.slice(0, 2)
-        );
-
         if (data.length === 0) {
           const sample = await brandsDb
             .collection(brand)
             .find()
             .limit(5)
             .toArray();
-          console.log("Sample data in DB for brand:", brand, sample);
           return res.send(data);
         }
 
         // Collect all unique columns across all documents
         const allColumns = Array.from(
-          new Set(data.flatMap((record) => Object.keys(record)))
+          new Set(data.flatMap((record) => Object.keys(record))),
         ).filter((col) => col !== "_id");
 
         // Define priority columns to appear first
@@ -911,11 +890,6 @@ connectToMongoDB()
           return normalizedRecord;
         });
 
-        console.log(
-          "Normalized data sample for brand:",
-          brand,
-          normalizedData.slice(0, 2)
-        );
         res.send(normalizedData);
       } catch (err) {
         console.error("Error fetching data:", err);
@@ -933,8 +907,6 @@ connectToMongoDB()
           });
         }
 
-        console.log("Received update request:", { id, updates, brand });
-
         let objectId;
         try {
           objectId = new ObjectId(id);
@@ -946,10 +918,8 @@ connectToMongoDB()
         const beforeUpdate = await brandsDb
           .collection(brand)
           .findOne({ _id: objectId });
-        console.log("Record before update:", beforeUpdate);
 
         const cleanedUpdates = cleanObjectForSampleData(updates);
-        console.log("Cleaned updates:", cleanedUpdates);
 
         // Create the $set stage, ensuring field names with dots are preserved
         const setStage = {
@@ -963,16 +933,9 @@ connectToMongoDB()
           .collection(brand)
           .updateOne({ _id: objectId }, [setStage]);
 
-        console.log("Update result:", {
-          matchedCount: result.matchedCount,
-          modifiedCount: result.modifiedCount,
-          acknowledged: result.acknowledged,
-        });
-
         const afterUpdate = await brandsDb
           .collection(brand)
           .findOne({ _id: objectId });
-        console.log("Record after update:", afterUpdate);
 
         if (result.matchedCount === 0) {
           console.warn("No record found for ID:", id);
@@ -1018,16 +981,9 @@ connectToMongoDB()
           });
         }
 
-        console.log("Received bulk update request:", {
-          updateCount: updates.length,
-          brand,
-        });
-
         const activeFormula = await db
           .collection("Formulas")
           .findOne({ brand, selected: true });
-
-        console.log("Active formula:", activeFormula || "None");
 
         const formulaColumnsCache = new Map();
         const transactionId = uuidv4();
@@ -1052,7 +1008,6 @@ connectToMongoDB()
               }
 
               const cleanedUpdates = cleanObjectForSampleData(updates);
-              console.log("Cleaned updates for ID:", id, cleanedUpdates);
 
               // Fetch original record to log previous values
               const originalRecord = await brandsDb
@@ -1067,9 +1022,6 @@ connectToMongoDB()
               let additionalUpdates = {};
               if (activeFormula) {
                 const { formula, column } = activeFormula;
-                console.log(
-                  `Applying formula ${formula} to column ${column} for ID ${id}`
-                );
 
                 let expression = formula;
                 let resultIsString = false;
@@ -1078,26 +1030,22 @@ connectToMongoDB()
                 if (!formulaColumns) {
                   formulaColumns = [];
                   const recordKeys = Object.keys(originalRecord).filter(
-                    (key) => key !== "_id"
+                    (key) => key !== "_id",
                   );
                   recordKeys.forEach((key) => {
                     const escapedKey = key.replace(
                       /[.*+?^${}()|[\]\\]/g,
-                      "\\$&"
+                      "\\$&",
                     );
                     const regex = new RegExp(
                       `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
-                      "gi"
+                      "gi",
                     );
                     if (regex.test(formula)) {
                       formulaColumns.push({ key, regex });
                     }
                   });
                   formulaColumnsCache.set(formula, formulaColumns);
-                  console.log(
-                    "Formula columns detected:",
-                    formulaColumns.map((c) => c.key)
-                  );
                 }
 
                 formulaColumns.forEach(({ key }) => {
@@ -1127,33 +1075,28 @@ connectToMongoDB()
                   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
                   const regex = new RegExp(
                     `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
-                    "g"
+                    "g",
                   );
                   expression = expression.replace(regex, `$1${cellValue}$3`);
-                  console.log(
-                    `Replaced ${key} with ${cellValue} in expression: ${expression}`
-                  );
                 });
 
                 try {
                   let result;
                   if (resultIsString) {
                     result = expression.replace(/"/g, "");
-                    console.log(`String result for ${column}: ${result}`);
                   } else {
                     result = evaluate(expression);
                     if (isNaN(result) || !isFinite(result)) {
                       throw new Error(
-                        `Formula evaluation resulted in invalid number: "${result}"`
+                        `Formula evaluation resulted in invalid number: "${result}"`,
                       );
                     }
-                    console.log(`Numeric result for ${column}: ${result}`);
                   }
                   additionalUpdates[column] = result;
                 } catch (error) {
                   console.error(
                     `Error evaluating formula for ID ${id}: ${error.message}`,
-                    { expression, formula, column }
+                    { expression, formula, column },
                   );
                   additionalUpdates[column] = 0;
                 }
@@ -1190,7 +1133,7 @@ connectToMongoDB()
                 },
               };
             })
-            .filter((op) => op !== null)
+            .filter((op) => op !== null),
         );
 
         if (bulkOperations.length === 0) {
@@ -1202,16 +1145,10 @@ connectToMongoDB()
 
         // Save transaction log
         await db.collection("TransactionLog").insertOne(transactionLog);
-        console.log("Transaction logged:", transactionId);
 
         const result = await brandsDb
           .collection(brand)
           .bulkWrite(bulkOperations);
-
-        console.log("Bulk update result:", {
-          matchedCount: result.matchedCount,
-          modifiedCount: result.modifiedCount,
-        });
 
         res.send({
           message: "Bulk update completed",
@@ -1241,15 +1178,10 @@ connectToMongoDB()
           .find({ brand })
           .limit(5)
           .toArray();
-        console.log("Sample TransactionLog entries before clear:", sampleLogs);
 
         const result = await db
           .collection("TransactionLog")
           .deleteMany({ brand });
-
-        console.log(
-          `Cleared ${result.deletedCount} transaction logs for brand: ${brand}`
-        );
 
         res.send({
           message: `Cleared ${result.deletedCount} transaction logs`,
@@ -1277,13 +1209,6 @@ connectToMongoDB()
             message: "Invalid request: Missing column, updates, or brand",
           });
         }
-
-        console.log("Received calculated column request:", {
-          column,
-          updateCount: updates.length,
-          isNewColumn,
-          brand,
-        });
 
         const transactionId = uuidv4();
         const transactionLog = {
@@ -1338,12 +1263,6 @@ connectToMongoDB()
 
         // Save transaction log
         await db.collection("TransactionLog").insertOne(transactionLog);
-        console.log("Transaction logged:", transactionId);
-
-        console.log("Calculated column update result:", {
-          modifiedCount,
-          totalUpdates: updates.length,
-        });
 
         if (modifiedCount === 0) {
           return res.status(200).send({
@@ -1386,8 +1305,6 @@ connectToMongoDB()
           return res.status(404).send({ message: "No actions to undo" });
         }
 
-        console.log("Undoing transaction:", transaction.transactionId);
-
         const bulkOperations = transaction.updates
           .map(({ id, originalValues }) => {
             try {
@@ -1410,7 +1327,7 @@ connectToMongoDB()
             .collection("TransactionLog")
             .updateOne(
               { transactionId: transaction.transactionId },
-              { $set: { status: "undone" } }
+              { $set: { status: "undone" } },
             );
           return res.status(200).send({
             message: "No valid records to undo, transaction marked as undone",
@@ -1426,14 +1343,8 @@ connectToMongoDB()
           .collection("TransactionLog")
           .updateOne(
             { transactionId: transaction.transactionId },
-            { $set: { status: "undone" } }
+            { $set: { status: "undone" } },
           );
-
-        console.log("Undo result:", {
-          transactionId: transaction.transactionId,
-          matchedCount: result.matchedCount,
-          modifiedCount: result.modifiedCount,
-        });
 
         res.send({
           message: "Undo completed",
@@ -1466,8 +1377,6 @@ connectToMongoDB()
           return res.status(404).send({ message: "No actions to redo" });
         }
 
-        console.log("Redoing transaction:", transaction.transactionId);
-
         const bulkOperations = transaction.updates
           .map(({ id, newValues }) => {
             try {
@@ -1490,7 +1399,7 @@ connectToMongoDB()
             .collection("TransactionLog")
             .updateOne(
               { transactionId: transaction.transactionId },
-              { $set: { status: "active" } }
+              { $set: { status: "active" } },
             );
           return res.status(200).send({
             message: "No valid records to redo, transaction marked as active",
@@ -1506,14 +1415,8 @@ connectToMongoDB()
           .collection("TransactionLog")
           .updateOne(
             { transactionId: transaction.transactionId },
-            { $set: { status: "active" } }
+            { $set: { status: "active" } },
           );
-
-        console.log("Redo result:", {
-          transactionId: transaction.transactionId,
-          matchedCount: result.matchedCount,
-          modifiedCount: result.modifiedCount,
-        });
 
         res.send({
           message: "Redo completed",
@@ -1581,9 +1484,8 @@ connectToMongoDB()
                 .pipe(csv())
                 .on("headers", (headerList) => {
                   headers = headerList.map((header) =>
-                    header.trim().replace(/\s+/g, "").replace(/\./g, "_")
+                    header.trim().replace(/\s+/g, "").replace(/\./g, "_"),
                   ); // Capture and clean headers
-                  console.log("CSV headers:", headers); // Debug: Log header order
                 })
                 .on("data", (row) => {
                   results.push(cleanObjectForBMData(row));
@@ -1603,9 +1505,8 @@ connectToMongoDB()
                     .trim()
                     .replace(/\s+/g, "")
                     .replace(/\./g, "_")
-                : ""
+                : "",
             ); // Capture and clean headers
-            console.log("Excel headers:", headers); // Debug: Log header order
             data = rawData.slice(1).map((row) => {
               const rowData = {};
               headers.forEach((header, index) => {
@@ -1624,19 +1525,11 @@ connectToMongoDB()
               .send({ message: "No valid data found in file" });
           }
 
-          console.log("Sample bank mapping data:", data.slice(0, 2));
-
           // Clear existing data in BMData collection
           await db.collection("BMData").deleteMany({});
-          console.log("Cleared existing BMData collection");
 
           // Insert new data
           const result = await db.collection("BMData").insertMany(data);
-          console.log(
-            "Insert result for BMData:",
-            result.insertedCount,
-            "documents"
-          );
 
           // Store the header order in a separate collection or document
           await db
@@ -1644,9 +1537,8 @@ connectToMongoDB()
             .updateOne(
               { _id: "headerOrder" },
               { $set: { headers } },
-              { upsert: true }
+              { upsert: true },
             );
-          console.log("Stored header order:", headers);
 
           await fs.unlink(filePath);
           res.send({
@@ -1660,7 +1552,7 @@ connectToMongoDB()
             error: err.message,
           });
         }
-      }
+      },
     );
 
     app.post("/api/bank-mapping-data", async (req, res) => {
@@ -1687,15 +1579,7 @@ connectToMongoDB()
           ])
           .toArray();
 
-        console.log("Found bank mapping records:", data.length);
-
         if (data.length === 0) {
-          const sample = await db
-            .collection("BMData")
-            .find()
-            .limit(5)
-            .toArray();
-          console.log("Sample bank mapping data in DB:", sample);
           return res.send([]);
         }
 
@@ -1704,14 +1588,12 @@ connectToMongoDB()
           .collection("BMDataHeaders")
           .findOne({ _id: "headerOrder" });
         const headers = headerDoc ? headerDoc.headers : [];
-        console.log("Retrieved header order:", headers);
 
         // If no headers are stored, fall back to the first document's keys
         const allColumns =
           headers.length > 0
             ? headers
             : Object.keys(data[0]).filter((col) => col !== "_id");
-        console.log("Final column order:", allColumns);
 
         const normalizedData = data.map((record) => {
           const normalizedRecord = { _id: record._id.toString() };
@@ -1722,10 +1604,6 @@ connectToMongoDB()
           return normalizedRecord;
         });
 
-        console.log(
-          "Normalized bank mapping data sample:",
-          normalizedData.slice(0, 2)
-        );
         res.send(normalizedData);
       } catch (err) {
         console.error("Error fetching bank mapping data:", err);
@@ -1740,7 +1618,6 @@ connectToMongoDB()
           return res.status(400).send({ message: "No valid IDs provided" });
         }
 
-        console.log("Received IDs for deletion:", ids);
         const objectIds = ids
           .map((id) => {
             try {
@@ -1761,10 +1638,7 @@ connectToMongoDB()
         const result = await db
           .collection("BMData")
           .deleteMany({ _id: { $in: objectIds } });
-        console.log("Delete result:", {
-          deletedCount: result.deletedCount,
-          deletedIds: ids,
-        });
+
         res.send({
           message: "Data deleted successfully",
           deletedCount: result.deletedCount,
@@ -1820,13 +1694,7 @@ connectToMongoDB()
               .send({ message: "No valid data found in file" });
           }
 
-          console.log("Sample store data:", data.slice(0, 2));
           const result = await db.collection("StoreData").insertMany(data);
-          console.log(
-            "Insert result for StoreData:",
-            result.insertedCount,
-            "documents"
-          );
 
           await fs.unlink(filePath);
           res.send({
@@ -1840,7 +1708,7 @@ connectToMongoDB()
             error: err.message,
           });
         }
-      }
+      },
     );
 
     // Endpoint to fetch StoreData
@@ -1854,21 +1722,13 @@ connectToMongoDB()
 
         const data = await db.collection("StoreData").find({}).toArray();
 
-        console.log("Found store data records:", data.length);
-
         if (data.length === 0) {
-          const sample = await db
-            .collection("StoreData")
-            .find()
-            .limit(5)
-            .toArray();
-          console.log("Sample store data in DB:", sample);
           return res.send({ storeData: [] });
         }
 
         // Dynamically collect all unique columns from the data
         const allColumns = Array.from(
-          new Set(data.flatMap((record) => Object.keys(record)))
+          new Set(data.flatMap((record) => Object.keys(record))),
         ).filter((col) => col !== "_id");
 
         // Ensure 'NAME' and 'NO' appear first, if present
@@ -1876,7 +1736,7 @@ connectToMongoDB()
         const finalColumns = [
           ...priorityColumns.filter((col) => allColumns.includes(col)),
           ...allColumns.filter(
-            (col) => !priorityColumns.includes(col) && col !== "_id"
+            (col) => !priorityColumns.includes(col) && col !== "_id",
           ),
         ];
 
@@ -1889,10 +1749,6 @@ connectToMongoDB()
           return normalizedRecord;
         });
 
-        console.log(
-          "Normalized store data sample:",
-          normalizedData.slice(0, 2)
-        );
         res.send({ storeData: normalizedData }); // Wrap the response in storeData
       } catch (err) {
         console.error("Error fetching store data:", err);
@@ -1908,7 +1764,6 @@ connectToMongoDB()
           return res.status(400).send({ message: "No valid IDs provided" });
         }
 
-        console.log("Received IDs for deletion:", ids);
         const objectIds = ids
           .map((id) => {
             try {
@@ -1929,10 +1784,7 @@ connectToMongoDB()
         const result = await db
           .collection("StoreData")
           .deleteMany({ _id: { $in: objectIds } });
-        console.log("Delete result:", {
-          deletedCount: result.deletedCount,
-          deletedIds: ids,
-        });
+
         res.send({
           message: "Data deleted successfully",
           deletedCount: result.deletedCount,
@@ -1959,13 +1811,7 @@ connectToMongoDB()
           return res.status(400).send({ message: "No valid data to insert" });
         }
 
-        console.log("Adding new store data:", cleanedData);
         const result = await db.collection("StoreData").insertOne(cleanedData);
-
-        console.log("Insert result:", {
-          insertedId: result.insertedId,
-          insertedCount: result.insertedCount,
-        });
 
         res.send({
           message: "New store data added successfully",
@@ -2014,13 +1860,7 @@ connectToMongoDB()
           return res.status(400).send({ message: "No valid data to insert" });
         }
 
-        console.log("Adding new bank mapping data:", cleanedData);
         const result = await db.collection("BMData").insertOne(cleanedData);
-
-        console.log("Insert result:", {
-          insertedId: result.insertedId,
-          insertedCount: result.insertedCount,
-        });
 
         res.send({
           message: "New bank mapping data added successfully",
@@ -2073,11 +1913,10 @@ connectToMongoDB()
                 NO: 1,
                 _id: 0,
               },
-            }
+            },
           )
           .toArray();
 
-        console.log(`Retrieved ${storeData.length} store data records`);
         res.send({ storeData });
       } catch (err) {
         console.error("Error fetching store data:", err);
@@ -2087,9 +1926,7 @@ connectToMongoDB()
       }
     });
 
-    app.listen(port, () => {
-      console.log(`Server listening on port ${port}`);
-    });
+    app.listen(port, () => {});
   })
   .catch((err) => {
     console.error("Failed to start server:", err);
@@ -2099,7 +1936,6 @@ connectToMongoDB()
 process.on("SIGINT", async () => {
   if (mongoClient) {
     await mongoClient.close();
-    console.log("MongoDB connection closed");
   }
   process.exit(0);
 });
