@@ -845,17 +845,41 @@ connectToMongoDB()
           });
         }
 
-        const formattedStartDate = start.format("MM-DD-YYYY");
-        const formattedEndDate = end.format("MM-DD-YYYY");
+        const startDateForQuery = new Date(start.format("YYYY-MM-DD"));
+        const endDateForQuery = new Date(end.format("YYYY-MM-DD"));
 
+        // 2. Use Aggregation to parse the stored strings into Dates for comparison
         const data = await brandsDb
           .collection(brand)
-          .find({
-            Date: {
-              $gte: formattedStartDate,
-              $lte: formattedEndDate,
+          .aggregate([
+            {
+              $addFields: {
+                // Create a temporary field that converts "MM-DD-YYYY" string to a real Date
+                __parsedDate: {
+                  $dateFromString: {
+                    dateString: "$Date",
+                    format: "%m-%d-%Y",
+                    onError: new Date("1970-01-01T00:00:00Z"), // Fallback if format is wrong
+                    onNull: new Date("1970-01-01T00:00:00Z"),
+                  },
+                },
+              },
             },
-          })
+            {
+              $match: {
+                // Filter using the real Date objects (Handles cross-year correctly)
+                __parsedDate: {
+                  $gte: startDateForQuery,
+                  $lte: endDateForQuery,
+                },
+              },
+            },
+            {
+              $project: {
+                __parsedDate: 0, // Remove the temporary field from the final result
+              },
+            },
+          ])
           .toArray();
 
         if (data.length === 0) {
