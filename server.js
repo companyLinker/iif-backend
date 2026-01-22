@@ -227,50 +227,44 @@ connectToMongoDB()
       try {
         if (!db) {
           await connectToMongoDB();
-          if (!db) throw new Error("Failed to connect to MongoDB");
         }
 
-        const { state, brand } = req.query;
-        const matchQuery = {};
-        if (state)
-          matchQuery.State = Array.isArray(state) ? { $in: state } : state;
-        if (brand)
-          matchQuery.Brand = Array.isArray(brand) ? { $in: brand } : brand;
+        const { brand } = req.query;
 
-        const states = await db
-          .collection("BMData")
-          .distinct("State", { State: { $ne: null } });
-        const brands = await db
-          .collection("BMData")
-          .distinct("Brand", { Brand: { $ne: null } });
+        // 1. Get Distinct Brands and States (Keep existing logic)
+        const brands = await db.collection(brandsDbName).distinct("Brand");
+        const states = await db.collection("BMData").distinct("State");
 
+        // 2. FETCH STORE MAPPINGS
+        // FIX: We removed the { Brand: brand } filter here.
+        // We now fetch ALL items that have a StoreNo.
+        // This solves the issue where "Popeye's" doesn't match "Popeyes" in the DB.
         const storeMappings = await db
           .collection("BMData")
           .find(
             {
-              ...matchQuery,
-              Name: { $ne: null },
+              $or: [
+                { StoreNo: { $exists: true, $ne: null } },
+                { storeno: { $exists: true, $ne: null } }, // Handle casing variations
+                { Store_No: { $exists: true, $ne: null } },
+              ],
             },
             {
               projection: {
-                Name: 1,
-                State: 1,
-                Brand: 1,
-                BankCOA: 1,
-                StoreNo: 1,
-                storeno: 1,
-                Store_No: 1,
                 _id: 0,
+                StoreNo: 1,
+                storeno: 1, // Fetch variations
+                Store_No: 1,
+                State: 1,
+                state: 1,
               },
             },
           )
-          .map((doc) => ({
-            ...doc,
-            StoreNo: doc.StoreNo || doc.storeno || doc.Store_No || "", // Normalize StoreNo
-          }))
           .toArray();
 
-        res.send({ states, brands, storeMappings });
+        console.log(`Sending ${storeMappings.length} mappings to frontend`); // Server-side log
+
+        res.send({ brands, states, storeMappings });
       } catch (err) {
         console.error("Error fetching filter options:", err);
         res.status(500).send({ message: "Error fetching filter options" });
@@ -845,6 +839,8 @@ connectToMongoDB()
           });
         }
 
+        // 1. Create JavaScript Date objects for comparison
+        // We format to YYYY-MM-DD first to ensure clean parsing into a Date object
         const startDateForQuery = new Date(start.format("YYYY-MM-DD"));
         const endDateForQuery = new Date(end.format("YYYY-MM-DD"));
 
