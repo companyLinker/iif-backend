@@ -262,8 +262,6 @@ connectToMongoDB()
           )
           .toArray();
 
-        console.log(`Sending ${storeMappings.length} mappings to frontend`); // Server-side log
-
         res.send({ brands, states, storeMappings });
       } catch (err) {
         console.error("Error fetching filter options:", err);
