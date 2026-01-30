@@ -1943,6 +1943,63 @@ connectToMongoDB()
           .send({ message: "Error fetching store data", error: err.message });
       }
     });
+    app.get("/api/bofa-accounts", async (req, res) => {
+      try {
+        if (!db) await connectToMongoDB();
+
+        const accounts = await db
+          .collection("bofa_transactions")
+          .aggregate([
+            {
+              $group: {
+                _id: {
+                  accountNumber: "$accountNumber",
+                  accountName: "$accountName",
+                },
+              },
+            },
+            {
+              $project: {
+                _id: 0,
+                accountNumber: "$_id.accountNumber",
+                accountName: "$_id.accountName",
+              },
+            },
+            { $sort: { accountName: 1 } },
+          ])
+          .toArray();
+
+        res.send(accounts);
+      } catch (err) {
+        console.error("Error fetching BofA accounts:", err);
+        res.status(500).send({ message: "Error fetching accounts" });
+      }
+    });
+
+    // 2. Fetch Data for Selected Accounts & Date Range
+    app.post("/api/bofa-data", async (req, res) => {
+      try {
+        if (!db) await connectToMongoDB();
+        const { accountNumbers, startDate, endDate } = req.body;
+
+        // Query match
+        const query = {
+          accountNumber: { $in: accountNumbers },
+          asOfDate: { $gte: startDate, $lte: endDate },
+        };
+
+        const transactions = await db
+          .collection("bofa_transactions")
+          .find(query)
+          .sort({ accountNumber: 1, asOfDate: 1 })
+          .toArray();
+
+        res.send(transactions);
+      } catch (err) {
+        console.error("Error fetching BofA transactions:", err);
+        res.status(500).send({ message: "Error fetching data" });
+      }
+    });
 
     app.listen(port, () => {});
   })
