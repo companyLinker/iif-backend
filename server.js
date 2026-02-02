@@ -1943,31 +1943,75 @@ connectToMongoDB()
           .send({ message: "Error fetching store data", error: err.message });
       }
     });
+
     app.get("/api/bofa-accounts", async (req, res) => {
       try {
         if (!db) await connectToMongoDB();
 
-        const accounts = await db
+        // 1. Get the list of accounts from Transactions (as before)
+        let accounts = await db
           .collection("bofa_transactions")
           .aggregate([
+            { $sort: { accountName: -1 } }, // Try to find a name if it exists
             {
               $group: {
-                _id: {
-                  accountNumber: "$accountNumber",
-                  accountName: "$accountName",
-                },
+                _id: "$accountNumber",
+                accountName: { $first: "$accountName" },
               },
             },
             {
               $project: {
                 _id: 0,
-                accountNumber: "$_id.accountNumber",
-                accountName: "$_id.accountName",
+                accountNumber: "$_id",
+                accountName: 1,
               },
             },
-            { $sort: { accountName: 1 } },
           ])
           .toArray();
+
+        // 2. Fetch the Master Mapping Data (BMData) to fill in the blanks
+        // We only fetch fields we need to optimize performance
+        const mappings = await db
+          .collection("BMData")
+          .find({})
+          .project({
+            BankAccountNo1: 1,
+            BankAccountNo2: 1,
+            BankAccountNo3: 1,
+            BankAccountNo4: 1,
+            CompanyTaxName: 1,
+          })
+          .toArray();
+
+        // 3. Merge: If accountName is missing, look it up in Mappings
+        accounts = accounts.map((acc) => {
+          // If we already found a name in the transactions, keep it
+          if (acc.accountName) return acc;
+
+          // Otherwise, search for the Account Number in BMData
+          const foundMap = mappings.find((m) => {
+            const accNumStr = String(acc.accountNumber);
+            return (
+              String(m.BankAccountNo1).includes(accNumStr) ||
+              String(m.BankAccountNo2).includes(accNumStr) ||
+              String(m.BankAccountNo3).includes(accNumStr) ||
+              String(m.BankAccountNo4).includes(accNumStr)
+            );
+          });
+
+          return {
+            accountNumber: acc.accountNumber,
+            // Use mapped name, or fall back to "Unknown" if still not found
+            accountName: foundMap ? foundMap.CompanyTaxName : "Unknown Entity",
+          };
+        });
+
+        // 4. Final Sort by Name
+        accounts.sort((a, b) => {
+          const nameA = a.accountName || "";
+          const nameB = b.accountName || "";
+          return nameA.localeCompare(nameB);
+        });
 
         res.send(accounts);
       } catch (err) {
