@@ -2,17 +2,18 @@ import express from "express";
 import multer from "multer";
 import { MongoClient, ObjectId } from "mongodb";
 import csv from "csv-parser";
-import fs from "fs/promises";
+import fs from "fs";
 import XLSX from "xlsx";
 import moment from "moment";
 import { evaluate } from "mathjs";
 import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
+import archiver from "archiver";
 dotenv.config();
 
 const app = express();
 app.use(express.json());
-const port = 3000;
+const port = 3001;
 
 // CORS configuration
 app.use((req, res, next) => {
@@ -530,6 +531,154 @@ connectToMongoDB()
       }
     });
 
+    app.post(
+      "/api/generate-cheque-sheet",
+      upload.single("file"),
+      async (req, res) => {
+        try {
+          if (!req.file) {
+            return res.status(400).send({ message: "No file uploaded" });
+          }
+
+          if (!db) await connectToMongoDB();
+
+          // 1. Fetch valid accounts where Cashpro is 'Yes'
+          const bmData = await db
+            .collection("BMData")
+            .find({
+              Cashpro: { $regex: /^yes$/i },
+            })
+            .toArray();
+
+          const validAccounts = new Set();
+
+          // Helper function to extract just the numbers/letters from the account string
+          const cleanBankAccount = (accStr) => {
+            if (!accStr) return "";
+            let cleaned = String(accStr)
+              .replace(/Acc No\s*:/i, "")
+              .trim();
+
+            // If Excel appended .00, split by decimal and keep the first part
+            if (cleaned.includes(".")) {
+              cleaned = cleaned.split(".")[0];
+            }
+
+            return cleaned.replace(/[^a-zA-Z0-9]/g, ""); // Strip remaining spaces/dashes
+          };
+
+          // Populate the Set with cleaned BMData account numbers
+          bmData.forEach((doc) => {
+            if (doc.BankAccountNo1)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo1));
+            if (doc.BankAccountNo2)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo2));
+            if (doc.BankAccountNo3)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo3));
+            if (doc.BankAccountNo4)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo4));
+          });
+
+          // 2. Read and parse the uploaded file
+          const fileContent = fs.readFileSync(req.file.path, "utf8");
+          const lines = fileContent.split(/\r?\n/);
+
+          const outputRows = [];
+          const logRows = [];
+
+          // Add header to the log file for clarity
+          logRows.push(
+            "Account Number,Check Number,Amount,Issue Date,Indicator,Payee,Reason Removed",
+          );
+
+          for (const line of lines) {
+            if (!line.trim()) continue; // Skip empty lines
+
+            // Split by comma, respecting quotes
+            const row = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+
+            // Skip the header row from the input file
+            if (row[0] && row[0].includes("Account Number")) continue;
+
+            // 3. Clean fields and format
+            // FIX: Clean the input account number to remove .00 and extract exact string
+            let rawAccountNum = row[0]
+              ? String(row[0]).replace(/['"]/g, "").trim()
+              : "";
+            if (rawAccountNum.includes(".")) {
+              rawAccountNum = rawAccountNum.split(".")[0]; // remove .00
+            }
+            const accountNum = rawAccountNum.replace(/[^a-zA-Z0-9]/g, "");
+
+            const checkNum = row[1] ? row[1].replace(/['"]/g, "").trim() : "";
+
+            // Keep the tab (\t) in amount but remove ONLY the quotes
+            const amount = row[2] ? row[2].replace(/"/g, "") : "";
+
+            // FIX: Format Date strictly to MM/DD/YYYY
+            let dateStr = row[3] ? row[3].replace(/['"]/g, "").trim() : "";
+            const parsedDate = moment(
+              dateStr,
+              [
+                "MM-DD-YYYY",
+                "MM/DD/YYYY",
+                "YYYY-MM-DD",
+                "M/D/YYYY",
+                "MM/DD/YY",
+                "M/D/YY",
+                "YYYY/MM/DD",
+              ],
+              true,
+            );
+            const formattedDate = parsedDate.isValid()
+              ? parsedDate.format("MM/DD/YYYY")
+              : dateStr;
+
+            const indicator = row[4] ? row[4].replace(/['"]/g, "").trim() : "";
+
+            // Keep Quotes for Payees containing commas
+            const payee = row[5] ? row[5].trim() : "";
+
+            const cleanedRowString = `${accountNum},${checkNum},${amount},${formattedDate},${indicator},${payee}`;
+
+            // 4. Validate against BMData set
+            if (validAccounts.has(accountNum)) {
+              outputRows.push(cleanedRowString);
+            } else {
+              logRows.push(
+                `${cleanedRowString},Account not matched in BMData or Cashpro != Yes`,
+              );
+            }
+          }
+
+          // Clean up uploaded file from server
+          await fs.promises.unlink(req.file.path).catch(console.error);
+
+          // 5. Generate ZIP File and send response
+          const archive = archiver("zip", { zlib: { level: 9 } });
+
+          res.setHeader("Content-Type", "application/zip");
+          res.setHeader(
+            "Content-Disposition",
+            'attachment; filename="ChequeSheets.zip"',
+          );
+
+          archive.pipe(res);
+
+          // Append generated files to the zip
+          archive.append(outputRows.join("\n"), { name: "output.csv" });
+          archive.append(logRows.join("\n"), { name: "removed_log.csv" });
+
+          await archive.finalize();
+        } catch (err) {
+          console.error("Error generating cheque sheets:", err);
+          res
+            .status(500)
+            .send({ message: "Error generating sheets", error: err.message });
+        }
+      },
+    );
+
     app.put("/api/formats/:id", async (req, res) => {
       try {
         if (!db) {
@@ -776,7 +925,7 @@ connectToMongoDB()
             // Optionally continue to next file or throw
           } finally {
             // Clean up uploaded file
-            await fs
+            await fs.promises
               .unlink(filePath)
               .catch((err) =>
                 console.error(`Failed to delete file ${filePath}:`, err),
@@ -1543,9 +1692,6 @@ connectToMongoDB()
               .send({ message: "No valid data found in file" });
           }
 
-          // Clear existing data in BMData collection
-          await db.collection("BMData").deleteMany({});
-
           // Insert new data
           const result = await db.collection("BMData").insertMany(data);
 
@@ -1558,7 +1704,7 @@ connectToMongoDB()
               { upsert: true },
             );
 
-          await fs.unlink(filePath);
+          await fs.promises.unlink(filePath);
           res.send({
             message: "Bank mapping data uploaded successfully",
             insertedCount: result.insertedCount,
@@ -1714,7 +1860,7 @@ connectToMongoDB()
 
           const result = await db.collection("StoreData").insertMany(data);
 
-          await fs.unlink(filePath);
+          await fs.promises.unlink(filePath);
           res.send({
             message: "Store data uploaded successfully",
             insertedCount: result.insertedCount,
