@@ -564,7 +564,7 @@ connectToMongoDB()
               cleaned = cleaned.split(".")[0];
             }
 
-            return cleaned.replace(/[^a-zA-Z0-9]/g, ""); // Strip remaining spaces/dashes
+            return cleaned.replace(/[^a-zA-Z0-9]/g, "");
           };
 
           // Populate the Set with cleaned BMData account numbers
@@ -601,7 +601,6 @@ connectToMongoDB()
             if (row[0] && row[0].includes("Account Number")) continue;
 
             // 3. Clean fields and format
-            // FIX: Clean the input account number to remove .00 and extract exact string
             let rawAccountNum = row[0]
               ? String(row[0]).replace(/['"]/g, "").trim()
               : "";
@@ -612,10 +611,10 @@ connectToMongoDB()
 
             const checkNum = row[1] ? row[1].replace(/['"]/g, "").trim() : "";
 
-            // Keep the tab (\t) in amount but remove ONLY the quotes
-            const amount = row[2] ? row[2].replace(/"/g, "") : "";
+            // FIX: Trim the amount to remove any extra spaces/tabs
+            const amount = row[2] ? row[2].replace(/['"]/g, "").trim() : "";
 
-            // FIX: Format Date strictly to MM/DD/YYYY
+            // Format Date strictly to MM/DD/YYYY
             let dateStr = row[3] ? row[3].replace(/['"]/g, "").trim() : "";
             const parsedDate = moment(
               dateStr,
@@ -639,6 +638,7 @@ connectToMongoDB()
             // Keep Quotes for Payees containing commas
             const payee = row[5] ? row[5].trim() : "";
 
+            // Removed the \t from the Account Number string
             const cleanedRowString = `${accountNum},${checkNum},${amount},${formattedDate},${indicator},${payee}`;
 
             // 4. Validate against BMData set
