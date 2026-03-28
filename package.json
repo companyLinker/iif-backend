@@ -13,9 +13,11 @@
   "description": "",
   "dependencies": {
     "archiver": "^7.0.1",
+    "axios": "^1.14.0",
     "csv-parser": "^3.0.0",
     "dotenv": "^16.6.1",
     "express": "^4.18.2",
+    "googleapis": "^171.4.0",
     "mathjs": "^14.5.2",
     "moment": "^2.29.4",
     "mongodb": "^6.3.0",
