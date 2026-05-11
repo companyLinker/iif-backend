@@ -2,17 +2,19 @@ import express from "express";
 import multer from "multer";
 import { MongoClient, ObjectId } from "mongodb";
 import csv from "csv-parser";
-import fs from "fs/promises";
+import fs from "fs";
 import XLSX from "xlsx";
 import moment from "moment";
 import { evaluate } from "mathjs";
 import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
+import archiver from "archiver";
+import axios from "axios";
 dotenv.config();
 
 const app = express();
 app.use(express.json());
-const port = 3000;
+const port = 3001;
 
 // CORS configuration
 app.use((req, res, next) => {
@@ -50,33 +52,43 @@ const upload = multer({
 
 let db;
 let brandsDb;
+let transactionsRef;
 let mongoClient;
+
+// Google Sheets Logging Function
+const logToGoogleSheet = async (logData) => {
+  const webhookUrl = process.env.VITE_GOOGLE_SHEET_WEBHOOK;
+  if (!webhookUrl) return;
+  try {
+    await axios.post(webhookUrl, logData);
+  } catch (err) {
+    console.error("Error logging to Google Sheet:", err.message);
+  }
+};
 
 async function connectToMongoDB() {
   try {
-    // 1. Check if we already have a valid connection
     if (
       mongoClient &&
       mongoClient.topology &&
       mongoClient.topology.isConnected()
     ) {
-      // Ensure db references are set even if client persists
       if (!db) db = mongoClient.db(dbName);
       if (!brandsDb) brandsDb = mongoClient.db(brandsDbName);
+      if (!transactionsRef) transactionsRef = mongoClient.db("Transactions");
       return mongoClient;
     }
 
-    // 2. Create new connection with pool settings
     mongoClient = await MongoClient.connect(mongoUrl, {
       connectTimeoutMS: 30000,
       socketTimeoutMS: 30000,
-      maxPoolSize: 50, // Allow up to 50 concurrent connections
+      maxPoolSize: 50,
     });
 
     db = mongoClient.db(dbName);
     brandsDb = mongoClient.db(brandsDbName);
+    transactionsRef = mongoClient.db("Transactions");
 
-    // 3. Initialize Indexes (Idempotent - safe to run multiple times)
     await db.collection("SampleData").createIndex({ Date: 1 });
     await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
     await db.collection("BMData").createIndex({ Name: 1 });
@@ -91,16 +103,13 @@ async function connectToMongoDB() {
       message: err.message,
       stack: err.stack,
     });
-    // Force reset if connection failed
     mongoClient = null;
     throw err;
   }
 }
 
-// Clean column names and values for SampleData
 function cleanObjectForSampleData(obj) {
   return Object.keys(obj).reduce((acc, key) => {
-    // Replace dots with underscores and remove extra spaces
     const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
     let value = obj[key];
 
@@ -109,12 +118,10 @@ function cleanObjectForSampleData(obj) {
       if (cleanKey.toLowerCase() !== "date") {
         const parsedNumber = parseFloat(value.replace(/[^0-9.-]/g, ""));
         if (!isNaN(parsedNumber) && value.match(/^-?\d*\.?\d*$/)) {
-          // Round to two decimal places for numeric strings
           value = Number(parsedNumber.toFixed(2));
         }
       }
     } else if (typeof value === "number" && !isNaN(value)) {
-      // Round numbers to two decimal places
       value = Number(value.toFixed(2));
     } else if (value === null || value === undefined) {
       value = null;
@@ -163,13 +170,12 @@ async function initializeTransactionLog() {
       .createIndex({ brand: 1, status: 1, createdAt: -1 });
     await db
       .collection("TransactionLog")
-      .createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 }); // 30 days TTL
+      .createIndex({ createdAt: 1 }, { expireAfterSeconds: 30 * 24 * 60 * 60 });
   } catch (err) {
     console.error("Error initializing TransactionLog:", err);
   }
 }
 
-// Clean column names and values for BMData
 function cleanObjectForBMData(obj) {
   const cleaned = Object.keys(obj).reduce((acc, key) => {
     const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
@@ -177,7 +183,6 @@ function cleanObjectForBMData(obj) {
 
     if (typeof value === "string") {
       value = value.trim().replace(/\x00/g, "");
-      // Explicitly treat 'Storeno_' as a string, not a date
       if (cleanKey.toLowerCase() === "storno") {
         acc[cleanKey] = value;
         return acc;
@@ -185,13 +190,11 @@ function cleanObjectForBMData(obj) {
     } else if (value instanceof Date) {
       value = moment(value).format("MM-DD-YYYY");
     } else if (typeof value === "number" && !isNaN(value)) {
-      // Only convert numbers to dates if they are in Excel serial date format
-      // and the key is explicitly 'Date'
       if (cleanKey.toLowerCase() === "date") {
         const date = new Date((value - 25569) * 86400 * 1000);
         value = moment(date).format("MM-DD-YYYY");
       } else {
-        value = value.toString(); // Treat other numbers as strings
+        value = value.toString();
       }
     }
 
@@ -207,7 +210,7 @@ connectToMongoDB()
   .then((client) => {
     mongoClient = client;
     initializeTransactionLog();
-    // Endpoint to get brand collections
+
     app.get("/api/brands", async (req, res) => {
       try {
         if (!brandsDb) {
@@ -227,50 +230,37 @@ connectToMongoDB()
       try {
         if (!db) {
           await connectToMongoDB();
-          if (!db) throw new Error("Failed to connect to MongoDB");
         }
 
-        const { state, brand } = req.query;
-        const matchQuery = {};
-        if (state)
-          matchQuery.State = Array.isArray(state) ? { $in: state } : state;
-        if (brand)
-          matchQuery.Brand = Array.isArray(brand) ? { $in: brand } : brand;
+        const { brand } = req.query;
 
-        const states = await db
-          .collection("BMData")
-          .distinct("State", { State: { $ne: null } });
-        const brands = await db
-          .collection("BMData")
-          .distinct("Brand", { Brand: { $ne: null } });
+        const brands = await db.collection(brandsDbName).distinct("Brand");
+        const states = await db.collection("BMData").distinct("State");
 
         const storeMappings = await db
           .collection("BMData")
           .find(
             {
-              ...matchQuery,
-              Name: { $ne: null },
+              $or: [
+                { StoreNo: { $exists: true, $ne: null } },
+                { storeno: { $exists: true, $ne: null } },
+                { Store_No: { $exists: true, $ne: null } },
+              ],
             },
             {
               projection: {
-                Name: 1,
-                State: 1,
-                Brand: 1,
-                BankCOA: 1,
+                _id: 0,
                 StoreNo: 1,
                 storeno: 1,
                 Store_No: 1,
-                _id: 0,
+                State: 1,
+                state: 1,
               },
             },
           )
-          .map((doc) => ({
-            ...doc,
-            StoreNo: doc.StoreNo || doc.storeno || doc.Store_No || "", // Normalize StoreNo
-          }))
           .toArray();
 
-        res.send({ states, brands, storeMappings });
+        res.send({ brands, states, storeMappings });
       } catch (err) {
         console.error("Error fetching filter options:", err);
         res.status(500).send({ message: "Error fetching filter options" });
@@ -358,38 +348,33 @@ connectToMongoDB()
         }
 
         const formulaId = req.params.id;
-        const { selected } = req.body;
+        const { selected, formula, column } = req.body;
 
-        let updateResult;
-        if (selected) {
-          const formula = await db
+        let updateData = {};
+        if (selected !== undefined) updateData.selected = selected;
+        if (formula !== undefined) updateData.formula = formula;
+        if (column !== undefined) updateData.column = column;
+
+        if (selected === true) {
+          const existing = await db
             .collection("Formulas")
             .findOne({ _id: new ObjectId(formulaId) });
-          if (!formula) {
+          if (!existing)
             return res.status(404).send({ message: "Formula not found" });
-          }
+
           await db.collection("Formulas").updateMany(
             {
-              brand: formula.brand,
+              brand: existing.brand,
               selected: true,
               _id: { $ne: new ObjectId(formulaId) },
             },
             { $set: { selected: false } },
           );
-          updateResult = await db
-            .collection("Formulas")
-            .updateOne(
-              { _id: new ObjectId(formulaId) },
-              { $set: { selected: true } },
-            );
-        } else {
-          updateResult = await db
-            .collection("Formulas")
-            .updateOne(
-              { _id: new ObjectId(formulaId) },
-              { $set: { selected: false } },
-            );
         }
+
+        const updateResult = await db
+          .collection("Formulas")
+          .updateOne({ _id: new ObjectId(formulaId) }, { $set: updateData });
 
         if (updateResult.matchedCount === 0) {
           return res.status(404).send({ message: "Formula not found" });
@@ -401,13 +386,12 @@ connectToMongoDB()
         res.status(200).send({
           ...updatedFormula,
           _id: updatedFormula._id.toString(),
-          selected: updatedFormula.selected,
         });
       } catch (err) {
-        console.error("Error toggling formula:", err);
+        console.error("Error toggling/updating formula:", err);
         res
           .status(500)
-          .send({ message: "Error toggling formula", error: err.message });
+          .send({ message: "Error updating formula", error: err.message });
       }
     });
 
@@ -475,7 +459,6 @@ connectToMongoDB()
           return acc;
         }, {});
 
-        // Validate calculatedColumns
         if (cleanedFormat.calculatedColumns) {
           if (!Array.isArray(cleanedFormat.calculatedColumns)) {
             return res
@@ -537,6 +520,133 @@ connectToMongoDB()
           .send({ message: "Error creating format", error: error.message });
       }
     });
+
+    app.post(
+      "/api/generate-cheque-sheet",
+      upload.single("file"),
+      async (req, res) => {
+        try {
+          if (!req.file) {
+            return res.status(400).send({ message: "No file uploaded" });
+          }
+
+          if (!db) await connectToMongoDB();
+
+          const bmData = await db
+            .collection("BMData")
+            .find({
+              Cashpro: { $regex: /^yes$/i },
+            })
+            .toArray();
+
+          const validAccounts = new Set();
+
+          const cleanBankAccount = (accStr) => {
+            if (!accStr) return "";
+            let cleaned = String(accStr)
+              .replace(/Acc No\s*:/i, "")
+              .trim();
+            if (cleaned.includes(".")) {
+              cleaned = cleaned.split(".")[0];
+            }
+            return cleaned.replace(/[^a-zA-Z0-9]/g, "");
+          };
+
+          bmData.forEach((doc) => {
+            if (doc.BankAccountNo1)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo1));
+            if (doc.BankAccountNo2)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo2));
+            if (doc.BankAccountNo3)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo3));
+            if (doc.BankAccountNo4)
+              validAccounts.add(cleanBankAccount(doc.BankAccountNo4));
+          });
+
+          const fileContent = fs.readFileSync(req.file.path, "utf8");
+          const lines = fileContent.split(/\r?\n/);
+
+          const outputRows = [];
+          const logRows = [];
+
+          logRows.push(
+            "Account Number,Check Number,Amount,Issue Date,Indicator,Payee,Reason Removed",
+          );
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+
+            const row = line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
+
+            if (row[0] && row[0].includes("Account Number")) continue;
+
+            let rawAccountNum = row[0]
+              ? String(row[0]).replace(/['"]/g, "").trim()
+              : "";
+            if (rawAccountNum.includes(".")) {
+              rawAccountNum = rawAccountNum.split(".")[0];
+            }
+            const accountNum = rawAccountNum.replace(/[^a-zA-Z0-9]/g, "");
+
+            const checkNum = row[1] ? row[1].replace(/['"]/g, "").trim() : "";
+
+            const amount = row[2] ? row[2].replace(/['"]/g, "").trim() : "";
+
+            let dateStr = row[3] ? row[3].replace(/['"]/g, "").trim() : "";
+            const parsedDate = moment(
+              dateStr,
+              [
+                "MM-DD-YYYY",
+                "MM/DD/YYYY",
+                "YYYY-MM-DD",
+                "M/D/YYYY",
+                "MM/DD/YY",
+                "M/D/YY",
+                "YYYY/MM/DD",
+              ],
+              true,
+            );
+            const formattedDate = parsedDate.isValid()
+              ? parsedDate.format("MM/DD/YYYY")
+              : dateStr;
+
+            const indicator = row[4] ? row[4].replace(/['"]/g, "").trim() : "";
+            const payee = row[5] ? row[5].trim() : "";
+
+            const cleanedRowString = `${accountNum},${checkNum},${amount},${formattedDate},${indicator},${payee}`;
+
+            if (validAccounts.has(accountNum)) {
+              outputRows.push(cleanedRowString);
+            } else {
+              logRows.push(
+                `${cleanedRowString},Account not matched in BMData or Cashpro != Yes`,
+              );
+            }
+          }
+
+          await fs.promises.unlink(req.file.path).catch(console.error);
+
+          const archive = archiver("zip", { zlib: { level: 9 } });
+
+          res.setHeader("Content-Type", "application/zip");
+          res.setHeader(
+            "Content-Disposition",
+            'attachment; filename="ChequeSheets.zip"',
+          );
+
+          archive.pipe(res);
+          archive.append(outputRows.join("\n"), { name: "output.csv" });
+          archive.append(logRows.join("\n"), { name: "removed_log.csv" });
+
+          await archive.finalize();
+        } catch (err) {
+          console.error("Error generating cheque sheets:", err);
+          res
+            .status(500)
+            .send({ message: "Error generating sheets", error: err.message });
+        }
+      },
+    );
 
     app.put("/api/formats/:id", async (req, res) => {
       try {
@@ -660,21 +770,16 @@ connectToMongoDB()
           return res.status(400).send({ message: "Brand is required" });
         }
 
-        // Ensure DB is connected
         if (!brandsDb) await connectToMongoDB();
 
-        // Create index for the brand collection if it doesn't exist
-        // This speeds up the duplicate check query significantly
         await brandsDb.collection(brand).createIndex({ StoreName: 1, Date: 1 });
 
         let totalInserted = 0;
         let totalDuplicates = 0;
         let totalSheets = 0;
 
-        // BATCH SIZE: Process 1000 rows at a time to prevent Timeouts/Memory crashes
         const BATCH_SIZE = 1000;
 
-        // Process files SEQUENTIALLY to save memory (using for...of instead of map/Promise.all)
         for (const file of req.files) {
           const filePath = file.path;
           const fileExtension = file.originalname
@@ -686,7 +791,6 @@ connectToMongoDB()
           let sheetCount = 0;
 
           try {
-            // --- Parsing Logic (Kept existing logic) ---
             if (fileExtension === "csv") {
               await new Promise((resolve, reject) => {
                 const results = [];
@@ -727,15 +831,12 @@ connectToMongoDB()
 
             if (fileData.length === 0) {
               console.warn("No data processed from file:", filePath);
-              continue; // Skip to next file
+              continue;
             }
 
-            // --- BATCH PROCESSING START ---
-            // We split the large fileData into smaller chunks
             for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
               const batch = fileData.slice(i, i + BATCH_SIZE);
 
-              // 1. Prepare keys for duplicate check
               const keys = batch
                 .filter((record) => record.StoreName && record.Date)
                 .map((record) => ({
@@ -745,7 +846,6 @@ connectToMongoDB()
 
               if (keys.length === 0) continue;
 
-              // 2. Find existing records ONLY for this batch
               const existingRecords = await brandsDb
                 .collection(brand)
                 .find({ $or: keys })
@@ -756,14 +856,12 @@ connectToMongoDB()
                 existingRecords.map((r) => `${r.StoreName}|${r.Date}`),
               );
 
-              // 3. Filter duplicates
               const recordsToInsert = batch.filter((record) => {
                 if (!record.StoreName || !record.Date) return false;
                 const key = `${record.StoreName}|${record.Date}`;
                 return !existingKeys.has(key);
               });
 
-              // 4. Insert Batch
               if (recordsToInsert.length > 0) {
                 const result = await brandsDb
                   .collection(brand)
@@ -772,19 +870,14 @@ connectToMongoDB()
               }
 
               totalDuplicates += batch.length - recordsToInsert.length;
-
-              // Small pause to allow Node event loop to handle other requests (prevents blocking)
               await new Promise((resolve) => setTimeout(resolve, 5));
             }
-            // --- BATCH PROCESSING END ---
 
             totalSheets += sheetCount;
           } catch (err) {
             console.error(`Error processing file ${file.originalname}:`, err);
-            // Optionally continue to next file or throw
           } finally {
-            // Clean up uploaded file
-            await fs
+            await fs.promises
               .unlink(filePath)
               .catch((err) =>
                 console.error(`Failed to delete file ${filePath}:`, err),
@@ -822,57 +915,108 @@ connectToMongoDB()
         }
 
         const { startDate, endDate, brand } = req.body;
+
         if (!startDate || !endDate || !brand) {
-          return res
-            .status(400)
-            .send({ message: "Start date, end date, and brand are required" });
+          return res.status(400).json({
+            success: false,
+            message: "Start date, end date, and brand are required",
+          });
         }
 
         const start = moment(
-          startDate,
-          ["MM-DD-YYYY", "M/D/YYYY", "MM/DD/YYYY", "YYYY-MM-DD", "M-D-YYYY"],
+          startDate.trim(),
+          [
+            "MM-DD-YYYY",
+            "M/D/YYYY",
+            "MM/DD/YYYY",
+            "YYYY-MM-DD",
+            "M-D-YYYY",
+            "MM.DD.YYYY",
+            "DD-MM-YYYY",
+            "D/M/YYYY",
+          ],
           true,
         );
+
         const end = moment(
-          endDate,
-          ["MM-DD-YYYY", "M/D/YYYY", "MM/DD/YYYY", "YYYY-MM-DD", "M-D-YYYY"],
+          endDate.trim(),
+          [
+            "MM-DD-YYYY",
+            "M/D/YYYY",
+            "MM/DD/YYYY",
+            "YYYY-MM-DD",
+            "M-D-YYYY",
+            "MM.DD.YYYY",
+            "DD-MM-YYYY",
+            "D/M/YYYY",
+          ],
           true,
         );
 
         if (!start.isValid() || !end.isValid()) {
-          return res.status(400).send({
-            message: "Invalid date format. Use MM-DD-YYYY (e.g., 03-01-2025)",
+          return res.status(400).json({
+            success: false,
+            message:
+              "Invalid date format. Please use MM-DD-YYYY (e.g., 03-22-2026)",
           });
         }
 
-        const formattedStartDate = start.format("MM-DD-YYYY");
-        const formattedEndDate = end.format("MM-DD-YYYY");
+        if (end.isBefore(start)) {
+          return res.status(400).json({
+            success: false,
+            message: "End date cannot be before start date",
+          });
+        }
+
+        const startOfDay = start.startOf("day").toDate();
+        const endOfDay = end.endOf("day").toDate();
+
+        const pipeline = [
+          {
+            $addFields: {
+              __parsedDate: {
+                $dateFromString: {
+                  dateString: "$Date",
+                  format: "%m-%d-%Y",
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            },
+          },
+          {
+            $match: {
+              __parsedDate: { $ne: null },
+              __parsedDate: {
+                $gte: startOfDay,
+                $lte: endOfDay,
+              },
+            },
+          },
+          {
+            $project: {
+              __parsedDate: 0,
+            },
+          },
+        ];
 
         const data = await brandsDb
           .collection(brand)
-          .find({
-            Date: {
-              $gte: formattedStartDate,
-              $lte: formattedEndDate,
-            },
-          })
+          .aggregate(pipeline)
           .toArray();
 
         if (data.length === 0) {
-          const sample = await brandsDb
-            .collection(brand)
-            .find()
-            .limit(5)
-            .toArray();
-          return res.send(data);
+          return res.status(200).json({
+            success: true,
+            data: [],
+            message: "No records found in selected date range",
+          });
         }
 
-        // Collect all unique columns across all documents
         const allColumns = Array.from(
           new Set(data.flatMap((record) => Object.keys(record))),
         ).filter((col) => col !== "_id");
 
-        // Define priority columns to appear first
         const priorityColumns = ["StoreName", "Date"];
         const finalColumns = [
           ...priorityColumns.filter((col) => allColumns.includes(col)),
@@ -890,10 +1034,18 @@ connectToMongoDB()
           return normalizedRecord;
         });
 
-        res.send(normalizedData);
+        res.status(200).json({
+          success: true,
+          data: normalizedData,
+          count: normalizedData.length,
+        });
       } catch (err) {
-        console.error("Error fetching data:", err);
-        res.status(500).send({ message: "Error fetching data" });
+        console.error("[ /api/data ] Error:", err);
+        res.status(500).json({
+          success: false,
+          message: "Internal server error while fetching data",
+          error: err.message,
+        });
       }
     });
 
@@ -901,64 +1053,26 @@ connectToMongoDB()
       try {
         const { id, updates, brand } = req.body;
         if (!id || !updates || !brand) {
-          console.error("Invalid update request:", { id, updates, brand });
           return res.status(400).send({
             message: "Invalid update request: Missing id, updates, or brand",
           });
         }
 
-        let objectId;
-        try {
-          objectId = new ObjectId(id);
-        } catch (err) {
-          console.error("Invalid ObjectId:", id);
-          return res.status(400).send({ message: "Invalid ObjectId format" });
-        }
-
-        const beforeUpdate = await brandsDb
-          .collection(brand)
-          .findOne({ _id: objectId });
-
-        const cleanedUpdates = cleanObjectForSampleData(updates);
-
-        // Create the $set stage, ensuring field names with dots are preserved
-        const setStage = {
-          $set: Object.keys(cleanedUpdates).reduce((acc, key) => {
-            acc[key] = cleanedUpdates[key];
-            return acc;
-          }, {}),
-        };
-
+        let objectId = new ObjectId(id);
         const result = await brandsDb
           .collection(brand)
-          .updateOne({ _id: objectId }, [setStage]);
+          .updateOne({ _id: objectId }, [
+            { $set: cleanObjectForSampleData(updates) },
+          ]);
 
-        const afterUpdate = await brandsDb
-          .collection(brand)
-          .findOne({ _id: objectId });
-
-        if (result.matchedCount === 0) {
-          console.warn("No record found for ID:", id);
+        if (result.matchedCount === 0)
           return res.status(404).send({ message: "Record not found" });
-        }
-
-        if (result.modifiedCount === 0) {
-          console.warn("No changes applied for ID:", id);
-          return res.status(200).send({
-            message: "No changes applied to the record",
-            before: beforeUpdate,
-            after: afterUpdate,
-          });
-        }
 
         res.send({
           message: "Data updated successfully",
           modifiedCount: result.modifiedCount,
-          before: beforeUpdate,
-          after: afterUpdate,
         });
       } catch (err) {
-        console.error("Error updating data:", err);
         res
           .status(500)
           .send({ message: "Error updating data", error: err.message });
@@ -967,24 +1081,21 @@ connectToMongoDB()
 
     app.post("/api/data-bulk-update", async (req, res) => {
       try {
-        const { updates, brand } = req.body;
+        const { updates, brand, username } = req.body; // username from frontend
         if (
           !updates ||
           !Array.isArray(updates) ||
           updates.length === 0 ||
           !brand
         ) {
-          console.error("Invalid bulk update request:", { updates, brand });
-          return res.status(400).send({
-            message:
-              "Invalid bulk update request: Missing or invalid updates or brand",
-          });
+          return res
+            .status(400)
+            .send({ message: "Invalid bulk update request" });
         }
 
         const activeFormula = await db
           .collection("Formulas")
           .findOne({ brand, selected: true });
-
         const formulaColumnsCache = new Map();
         const transactionId = uuidv4();
         const transactionLog = {
@@ -997,167 +1108,110 @@ connectToMongoDB()
         };
 
         const bulkOperations = await Promise.all(
-          updates
-            .map(async ({ id, updates }) => {
-              let objectId;
-              try {
-                objectId = new ObjectId(id);
-              } catch (err) {
-                console.warn("Invalid ObjectId skipped:", id);
-                return null;
+          updates.map(async ({ id, updates: newUpdates }) => {
+            let objectId = new ObjectId(id);
+            const cleanedUpdates = cleanObjectForSampleData(newUpdates);
+            const originalRecord = await brandsDb
+              .collection(brand)
+              .findOne({ _id: objectId });
+            if (!originalRecord) return null;
+
+            // LOGGING LOGIC START
+            for (const colName in cleanedUpdates) {
+              const oldValue = originalRecord[colName];
+              const newValue = cleanedUpdates[colName];
+              if (String(oldValue) !== String(newValue)) {
+                await logToGoogleSheet({
+                  username: username || "System",
+                  brand: brand,
+                  recordId: id,
+                  columnName: colName,
+                  oldValue: oldValue ?? "NULL",
+                  newValue: newValue,
+                  date: originalRecord.Date,
+                  store: originalRecord.StoreName,
+                });
               }
+            }
+            // LOGGING LOGIC END
 
-              const cleanedUpdates = cleanObjectForSampleData(updates);
-
-              // Fetch original record to log previous values
-              const originalRecord = await brandsDb
-                .collection(brand)
-                .findOne({ _id: objectId }, { projection: { _id: 0 } });
-
-              if (!originalRecord) {
-                console.warn(`Record not found for ID: ${id}`);
-                return null;
-              }
-
-              let additionalUpdates = {};
-              if (activeFormula) {
-                const { formula, column } = activeFormula;
-
-                let expression = formula;
-                let resultIsString = false;
-
-                let formulaColumns = formulaColumnsCache.get(formula);
-                if (!formulaColumns) {
-                  formulaColumns = [];
-                  const recordKeys = Object.keys(originalRecord).filter(
-                    (key) => key !== "_id",
-                  );
-                  recordKeys.forEach((key) => {
-                    const escapedKey = key.replace(
-                      /[.*+?^${}()|[\]\\]/g,
-                      "\\$&",
-                    );
-                    const regex = new RegExp(
-                      `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
-                      "gi",
-                    );
-                    if (regex.test(formula)) {
-                      formulaColumns.push({ key, regex });
-                    }
-                  });
-                  formulaColumnsCache.set(formula, formulaColumns);
-                }
-
-                formulaColumns.forEach(({ key }) => {
-                  let cellValue =
-                    key in cleanedUpdates
-                      ? cleanedUpdates[key]
-                      : originalRecord[key];
-                  if (
-                    cellValue === null ||
-                    cellValue === undefined ||
-                    cellValue === ""
-                  ) {
-                    cellValue = 0;
-                  } else if (typeof cellValue === "string") {
-                    const cleanedValue = cellValue.replace(/[^0-9.-]/g, "");
-                    const parsedValue = parseFloat(cleanedValue);
-                    if (
-                      isNaN(parsedValue) ||
-                      !cleanedValue.match(/^-?\d*\.?\d*$/)
-                    ) {
-                      resultIsString = true;
-                      cellValue = `"${cellValue}"`;
-                    } else {
-                      cellValue = parsedValue;
-                    }
-                  }
+            let additionalUpdates = {};
+            if (activeFormula) {
+              const { formula, column } = activeFormula;
+              let expression = formula;
+              let resultIsString = false;
+              let formulaColumns = formulaColumnsCache.get(formula);
+              if (!formulaColumns) {
+                formulaColumns = [];
+                Object.keys(originalRecord).forEach((key) => {
                   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
                   const regex = new RegExp(
                     `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
-                    "g",
+                    "gi",
                   );
-                  expression = expression.replace(regex, `$1${cellValue}$3`);
+                  if (regex.test(formula)) formulaColumns.push({ key, regex });
                 });
-
-                try {
-                  let result;
-                  if (resultIsString) {
-                    result = expression.replace(/"/g, "");
-                  } else {
-                    result = evaluate(expression);
-                    if (isNaN(result) || !isFinite(result)) {
-                      throw new Error(
-                        `Formula evaluation resulted in invalid number: "${result}"`,
-                      );
-                    }
-                  }
-                  additionalUpdates[column] = result;
-                } catch (error) {
-                  console.error(
-                    `Error evaluating formula for ID ${id}: ${error.message}`,
-                    { expression, formula, column },
-                  );
-                  additionalUpdates[column] = 0;
-                }
+                formulaColumnsCache.set(formula, formulaColumns);
               }
 
-              // Log the original and new values
-              const allUpdates = { ...cleanedUpdates, ...additionalUpdates };
-              const originalValues = {};
-              Object.keys(allUpdates).forEach((key) => {
-                originalValues[key] =
-                  originalRecord[key] !== undefined
-                    ? originalRecord[key]
-                    : null;
+              formulaColumns.forEach(({ key }) => {
+                let cellValue =
+                  key in cleanedUpdates
+                    ? cleanedUpdates[key]
+                    : originalRecord[key];
+                cellValue =
+                  cellValue === null || cellValue === "" ? 0 : cellValue;
+                if (typeof cellValue === "string") {
+                  const parsed = parseFloat(cellValue.replace(/[^0-9.-]/g, ""));
+                  if (isNaN(parsed)) {
+                    resultIsString = true;
+                    cellValue = `"${cellValue}"`;
+                  } else cellValue = parsed;
+                }
+                const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const regex = new RegExp(
+                  `(^|[\\s+\\-*/%\\(])\\s*(${escapedKey})\\s*([\\s+\\-*/%\\)]|$)`,
+                  "g",
+                );
+                expression = expression.replace(regex, `$1${cellValue}$3`);
               });
 
-              transactionLog.updates.push({
-                id,
-                originalValues,
-                newValues: allUpdates,
-              });
+              try {
+                let result = resultIsString
+                  ? expression.replace(/"/g, "")
+                  : Number(parseFloat(evaluate(expression)).toFixed(2));
+                additionalUpdates[column] = result;
+              } catch (e) {
+                additionalUpdates[column] = 0;
+              }
+            }
 
-              return {
-                updateOne: {
-                  filter: { _id: objectId },
-                  update: {
-                    $set: {
-                      ...Object.keys(cleanedUpdates).reduce((acc, key) => {
-                        acc[key] = cleanedUpdates[key];
-                        return acc;
-                      }, {}),
-                      ...additionalUpdates,
-                    },
-                  },
-                },
-              };
-            })
-            .filter((op) => op !== null),
+            const allUpdates = { ...cleanedUpdates, ...additionalUpdates };
+            transactionLog.updates.push({
+              id,
+              originalValues: originalRecord,
+              newValues: allUpdates,
+            });
+
+            return {
+              updateOne: {
+                filter: { _id: objectId },
+                update: { $set: allUpdates },
+              },
+            };
+          }),
         );
 
-        if (bulkOperations.length === 0) {
-          console.warn("No valid operations to execute");
-          return res
-            .status(400)
-            .send({ message: "No valid updates to process" });
-        }
-
-        // Save transaction log
         await db.collection("TransactionLog").insertOne(transactionLog);
-
         const result = await brandsDb
           .collection(brand)
-          .bulkWrite(bulkOperations);
-
+          .bulkWrite(bulkOperations.filter((op) => op !== null));
         res.send({
           message: "Bulk update completed",
-          matchedCount: result.matchedCount,
           modifiedCount: result.modifiedCount,
           transactionId,
         });
       } catch (err) {
-        console.error("Error in bulk update:", err);
         res.status(500).send({
           message: "Error performing bulk update",
           error: err.message,
@@ -1168,48 +1222,21 @@ connectToMongoDB()
     app.post("/api/clear-transaction-logs", async (req, res) => {
       try {
         const { brand } = req.body;
-        if (!brand) {
-          return res.status(400).send({ message: "Brand is required" });
-        }
-
-        // Log sample TransactionLog entries for debugging
-        const sampleLogs = await db
-          .collection("TransactionLog")
-          .find({ brand })
-          .limit(5)
-          .toArray();
-
         const result = await db
           .collection("TransactionLog")
           .deleteMany({ brand });
-
         res.send({
-          message: `Cleared ${result.deletedCount} transaction logs`,
+          message: `Cleared ${result.deletedCount} logs`,
           deletedCount: result.deletedCount,
         });
       } catch (err) {
-        console.error("Error clearing transaction logs:", err);
-        res.status(500).send({
-          message: "Error clearing transaction logs",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error clearing logs" });
       }
     });
 
     app.post("/api/data-calculated-column", async (req, res) => {
       try {
-        const { column, updates, isNewColumn, brand } = req.body;
-        if (!column || !updates || updates.length === 0 || !brand) {
-          console.error("Invalid calculated column request:", {
-            column,
-            updates,
-            brand,
-          });
-          return res.status(400).send({
-            message: "Invalid request: Missing column, updates, or brand",
-          });
-        }
-
+        const { column, updates, isNewColumn, brand, username } = req.body;
         const transactionId = uuidv4();
         const transactionLog = {
           transactionId,
@@ -1222,241 +1249,188 @@ connectToMongoDB()
           createdAt: new Date(),
         };
 
-        let modifiedCount = 0;
         for (const update of updates) {
           const { _id, value } = update;
-          try {
-            const objectId = new ObjectId(_id);
-            const originalRecord = await brandsDb
-              .collection(brand)
-              .findOne({ _id: objectId }, { projection: { [column]: 1 } });
+          const objectId = new ObjectId(_id);
+          const originalRecord = await brandsDb
+            .collection(brand)
+            .findOne(
+              { _id: objectId },
+              { projection: { [column]: 1, Date: 1, StoreName: 1 } },
+            );
+          const originalValue = originalRecord ? originalRecord[column] : null;
 
-            const originalValue = originalRecord
-              ? originalRecord[column]
-              : null;
-
-            transactionLog.updates.push({
-              id: _id,
-              originalValues: { [column]: originalValue },
-              newValues: { [column]: value },
-            });
-
-            const updateOperation = isNewColumn
-              ? { $set: { [column]: value } }
-              : { $set: { [column]: value } };
-
-            const result = await brandsDb
-              .collection(brand)
-              .updateOne({ _id: objectId }, updateOperation);
-
-            if (result.matchedCount === 0) {
-              console.warn(`No record found for ID: ${_id}`);
-              continue;
-            }
-
-            modifiedCount += result.modifiedCount;
-          } catch (err) {
-            console.error(`Error processing update for ID ${_id}:`, err);
-            continue;
-          }
-        }
-
-        // Save transaction log
-        await db.collection("TransactionLog").insertOne(transactionLog);
-
-        if (modifiedCount === 0) {
-          return res.status(200).send({
-            message: "No records were modified",
-            modifiedCount,
-            transactionId,
+          // Log the calculation
+          await logToGoogleSheet({
+            username: username || "System",
+            brand: brand,
+            recordId: _id,
+            columnName: column,
+            oldValue: originalValue ?? "NULL",
+            newValue: value,
+            date: originalRecord?.Date,
+            store: originalRecord?.StoreName,
           });
+
+          transactionLog.updates.push({
+            id: _id,
+            originalValues: { [column]: originalValue },
+            newValues: { [column]: value },
+          });
+          await brandsDb
+            .collection(brand)
+            .updateOne({ _id: objectId }, { $set: { [column]: value } });
         }
 
-        res.send({
-          message: isNewColumn
-            ? `New column '${column}' added successfully`
-            : `Column '${column}' updated successfully`,
-          modifiedCount,
-          transactionId,
-        });
+        await db.collection("TransactionLog").insertOne(transactionLog);
+        res.send({ message: `Column '${column}' processed`, transactionId });
       } catch (err) {
-        console.error("Error processing calculated column:", err);
-        res.status(500).send({
-          message: "Error processing calculated column",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error processing calculated column" });
       }
     });
 
-    // New endpoint for undo operation
     app.post("/api/undo", async (req, res) => {
       try {
-        const { brand } = req.body;
-        if (!brand) {
+        const { brand, username } = req.body; // username from frontend
+        if (!brand)
           return res.status(400).send({ message: "Brand is required" });
-        }
 
-        // Find the most recent active transaction
         const transaction = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "active" }, { sort: { createdAt: -1 } });
 
-        if (!transaction) {
+        if (!transaction)
           return res.status(404).send({ message: "No actions to undo" });
-        }
 
-        const bulkOperations = transaction.updates
-          .map(({ id, originalValues }) => {
-            try {
-              const objectId = new ObjectId(id);
-              return {
-                updateOne: {
-                  filter: { _id: objectId },
-                  update: { $set: originalValues },
-                },
-              };
-            } catch (err) {
-              console.warn(`Invalid ObjectId for undo: ${id}`);
-              return null;
+        const bulkOps = [];
+        for (const update of transaction.updates) {
+          const { id, originalValues } = update;
+          const objectId = new ObjectId(id);
+
+          // Fetch current state before reverting to log the change
+          const currentState = await brandsDb
+            .collection(brand)
+            .findOne({ _id: objectId });
+
+          if (currentState) {
+            for (const key in originalValues) {
+              const oldValue = currentState[key];
+              const newValue = originalValues[key];
+
+              if (String(oldValue) !== String(newValue)) {
+                await logToGoogleSheet({
+                  username: username || "System (Undo)",
+                  brand: brand,
+                  recordId: id,
+                  columnName: key + " (UNDO)", // Mark as undo
+                  oldValue: oldValue ?? "NULL",
+                  newValue: newValue ?? "NULL",
+                  date: currentState.Date,
+                  store: currentState.StoreName,
+                });
+              }
             }
-          })
-          .filter((op) => op !== null);
+          }
 
-        if (bulkOperations.length === 0) {
-          await db
-            .collection("TransactionLog")
-            .updateOne(
-              { transactionId: transaction.transactionId },
-              { $set: { status: "undone" } },
-            );
-          return res.status(200).send({
-            message: "No valid records to undo, transaction marked as undone",
+          bulkOps.push({
+            updateOne: {
+              filter: { _id: objectId },
+              update: { $set: originalValues },
+            },
           });
         }
 
-        const result = await brandsDb
-          .collection(brand)
-          .bulkWrite(bulkOperations);
-
-        // Mark transaction as undone
+        const result = await brandsDb.collection(brand).bulkWrite(bulkOps);
         await db
           .collection("TransactionLog")
           .updateOne(
             { transactionId: transaction.transactionId },
             { $set: { status: "undone" } },
           );
-
         res.send({
-          message: "Undo completed",
-          matchedCount: result.matchedCount,
+          message: "Undo completed and logged",
           modifiedCount: result.modifiedCount,
         });
       } catch (err) {
-        console.error("Error performing undo:", err);
-        res.status(500).send({
-          message: "Error performing undo",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error performing undo" });
       }
     });
 
-    // New endpoint for redo operation
     app.post("/api/redo", async (req, res) => {
       try {
-        const { brand } = req.body;
-        if (!brand) {
-          return res.status(400).send({ message: "Brand is required" });
-        }
-
-        // Find the most recent undone transaction
+        const { brand, username } = req.body;
         const transaction = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "undone" }, { sort: { createdAt: -1 } });
 
-        if (!transaction) {
+        if (!transaction)
           return res.status(404).send({ message: "No actions to redo" });
-        }
 
-        const bulkOperations = transaction.updates
-          .map(({ id, newValues }) => {
-            try {
-              const objectId = new ObjectId(id);
-              return {
-                updateOne: {
-                  filter: { _id: objectId },
-                  update: { $set: newValues },
-                },
-              };
-            } catch (err) {
-              console.warn(`Invalid ObjectId for redo: ${id}`);
-              return null;
+        const bulkOps = [];
+        for (const update of transaction.updates) {
+          const { id, newValues } = update;
+          const objectId = new ObjectId(id);
+
+          const currentState = await brandsDb
+            .collection(brand)
+            .findOne({ _id: objectId });
+
+          if (currentState) {
+            for (const key in newValues) {
+              const oldValue = currentState[key];
+              const newValue = newValues[key];
+
+              if (String(oldValue) !== String(newValue)) {
+                await logToGoogleSheet({
+                  username: username || "System (Redo)",
+                  brand: brand,
+                  recordId: id,
+                  columnName: key + " (REDO)", // Mark as redo
+                  oldValue: oldValue ?? "NULL",
+                  newValue: newValue ?? "NULL",
+                  date: currentState.Date,
+                  store: currentState.StoreName,
+                });
+              }
             }
-          })
-          .filter((op) => op !== null);
+          }
 
-        if (bulkOperations.length === 0) {
-          await db
-            .collection("TransactionLog")
-            .updateOne(
-              { transactionId: transaction.transactionId },
-              { $set: { status: "active" } },
-            );
-          return res.status(200).send({
-            message: "No valid records to redo, transaction marked as active",
+          bulkOps.push({
+            updateOne: {
+              filter: { _id: objectId },
+              update: { $set: newValues },
+            },
           });
         }
 
-        const result = await brandsDb
-          .collection(brand)
-          .bulkWrite(bulkOperations);
-
-        // Mark transaction as active
+        const result = await brandsDb.collection(brand).bulkWrite(bulkOps);
         await db
           .collection("TransactionLog")
           .updateOne(
             { transactionId: transaction.transactionId },
             { $set: { status: "active" } },
           );
-
         res.send({
-          message: "Redo completed",
-          matchedCount: result.matchedCount,
+          message: "Redo completed and logged",
           modifiedCount: result.modifiedCount,
         });
       } catch (err) {
-        console.error("Error performing redo:", err);
-        res.status(500).send({
-          message: "Error performing redo",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error performing redo" });
       }
     });
 
     app.post("/api/check-transactions", async (req, res) => {
       try {
         const { brand } = req.body;
-        if (!brand) {
-          return res.status(400).send({ message: "Brand is required" });
-        }
-
         const canUndo = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "active" }, { sort: { createdAt: -1 } });
-
         const canRedo = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "undone" }, { sort: { createdAt: -1 } });
-
-        res.send({
-          canUndo: !!canUndo,
-          canRedo: !!canRedo,
-        });
+        res.send({ canUndo: !!canUndo, canRedo: !!canRedo });
       } catch (err) {
-        console.error("Error checking transactions:", err);
-        res.status(500).send({
-          message: "Error checking transactions",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error checking transactions" });
       }
     });
 
@@ -1465,73 +1439,49 @@ connectToMongoDB()
       upload.single("file"),
       async (req, res) => {
         try {
-          if (!req.file) {
+          if (!req.file)
             return res.status(400).send({ message: "No file uploaded" });
-          }
-
           const filePath = req.file.path;
           const fileExtension = req.file.originalname
             .split(".")
             .pop()
             .toLowerCase();
           let data = [];
-          let headers = []; // Store the header order
+          let headers = [];
 
           if (fileExtension === "csv") {
             await new Promise((resolve, reject) => {
               const results = [];
               fs.createReadStream(filePath)
                 .pipe(csv())
-                .on("headers", (headerList) => {
-                  headers = headerList.map((header) =>
+                .on("headers", (h) => {
+                  headers = h.map((header) =>
                     header.trim().replace(/\s+/g, "").replace(/\./g, "_"),
-                  ); // Capture and clean headers
+                  );
                 })
-                .on("data", (row) => {
-                  results.push(cleanObjectForBMData(row));
-                })
+                .on("data", (row) => results.push(cleanObjectForBMData(row)))
                 .on("end", resolve)
                 .on("error", reject);
               data = results;
             });
-          } else if (fileExtension === "xlsx" || fileExtension === "xls") {
+          } else {
             const workbook = XLSX.readFile(filePath);
             const sheet = workbook.Sheets[workbook.SheetNames[0]];
             const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-            headers = rawData[0].map((header) =>
-              header
-                ? header
-                    .toString()
-                    .trim()
-                    .replace(/\s+/g, "")
-                    .replace(/\./g, "_")
+            headers = rawData[0].map((h) =>
+              h
+                ? h.toString().trim().replace(/\s+/g, "").replace(/\./g, "_")
                 : "",
-            ); // Capture and clean headers
+            );
             data = rawData.slice(1).map((row) => {
               const rowData = {};
-              headers.forEach((header, index) => {
-                rowData[header] = row[index] !== undefined ? row[index] : null;
-              });
+              headers.forEach(
+                (h, i) => (rowData[h] = row[i] !== undefined ? row[i] : null),
+              );
               return cleanObjectForBMData(rowData);
             });
-          } else {
-            return res.status(400).send({ message: "Invalid file format" });
           }
-
-          if (data.length === 0) {
-            console.warn("No data processed from file:", filePath);
-            return res
-              .status(400)
-              .send({ message: "No valid data found in file" });
-          }
-
-          // Clear existing data in BMData collection
-          await db.collection("BMData").deleteMany({});
-
-          // Insert new data
           const result = await db.collection("BMData").insertMany(data);
-
-          // Store the header order in a separate collection or document
           await db
             .collection("BMDataHeaders")
             .updateOne(
@@ -1539,33 +1489,20 @@ connectToMongoDB()
               { $set: { headers } },
               { upsert: true },
             );
-
-          await fs.unlink(filePath);
+          await fs.promises.unlink(filePath);
           res.send({
-            message: "Bank mapping data uploaded successfully",
+            message: "Bank mapping data uploaded",
             insertedCount: result.insertedCount,
           });
         } catch (err) {
-          console.error("Bank mapping upload error:", err);
-          res.status(500).send({
-            message: "Error uploading bank mapping file",
-            error: err.message,
-          });
+          res.status(500).send({ message: "Error uploading bank mapping" });
         }
       },
     );
 
     app.post("/api/bank-mapping-data", async (req, res) => {
       try {
-        if (!db) {
-          await connectToMongoDB();
-          if (!db)
-            return res.status(503).send({ message: "Database not connected" });
-        }
-
-        const body = req.body || {};
-        const { state = [], posName = [], brand = [] } = body;
-
+        const { state = [], posName = [], brand = [] } = req.body || {};
         let data = await db
           .collection("BMData")
           .aggregate([
@@ -1578,364 +1515,308 @@ connectToMongoDB()
             },
           ])
           .toArray();
-
-        if (data.length === 0) {
-          return res.send([]);
-        }
-
-        // Retrieve stored header order
+        if (data.length === 0) return res.send([]);
         const headerDoc = await db
           .collection("BMDataHeaders")
           .findOne({ _id: "headerOrder" });
         const headers = headerDoc ? headerDoc.headers : [];
-
-        // If no headers are stored, fall back to the first document's keys
         const allColumns =
           headers.length > 0
             ? headers
             : Object.keys(data[0]).filter((col) => col !== "_id");
-
-        const normalizedData = data.map((record) => {
-          const normalizedRecord = { _id: record._id.toString() };
-          allColumns.forEach((col) => {
-            normalizedRecord[col] =
-              record[col] !== undefined ? record[col] : null;
-          });
-          return normalizedRecord;
-        });
-
-        res.send(normalizedData);
+        res.send(
+          data.map((record) => {
+            const normalized = { _id: record._id.toString() };
+            allColumns.forEach(
+              (col) =>
+                (normalized[col] =
+                  record[col] !== undefined ? record[col] : null),
+            );
+            return normalized;
+          }),
+        );
       } catch (err) {
-        console.error("Error fetching bank mapping data:", err);
-        res.status(500).send({ message: "Error fetching bank mapping data" });
+        res.status(500).send({ message: "Error fetching mapping data" });
       }
     });
 
     app.post("/api/bank-mapping-delete", async (req, res) => {
       try {
         const { ids } = req.body;
-        if (!ids || !Array.isArray(ids) || ids.length === 0) {
-          return res.status(400).send({ message: "No valid IDs provided" });
-        }
-
-        const objectIds = ids
-          .map((id) => {
-            try {
-              return new ObjectId(id);
-            } catch (err) {
-              console.warn(`Invalid ObjectId skipped: ${id}`);
-              return null;
-            }
-          })
-          .filter((id) => id !== null);
-
-        if (objectIds.length === 0) {
-          return res
-            .status(400)
-            .send({ message: "No valid ObjectIds provided" });
-        }
-
         const result = await db
           .collection("BMData")
-          .deleteMany({ _id: { $in: objectIds } });
-
+          .deleteMany({ _id: { $in: ids.map((id) => new ObjectId(id)) } });
         res.send({
-          message: "Data deleted successfully",
+          message: "Deleted successfully",
           deletedCount: result.deletedCount,
         });
       } catch (err) {
-        console.error("Error deleting data:", err);
-        res
-          .status(500)
-          .send({ message: "Error deleting data", error: err.message });
+        res.status(500).send({ message: "Error deleting data" });
       }
     });
 
-    // Endpoint to upload StoreData
     app.post(
       "/api/store-data-upload",
       upload.single("file"),
       async (req, res) => {
         try {
-          if (!req.file) {
+          if (!req.file)
             return res.status(400).send({ message: "No file uploaded" });
-          }
-
           const filePath = req.file.path;
           const fileExtension = req.file.originalname
             .split(".")
             .pop()
             .toLowerCase();
           let data = [];
-
           if (fileExtension === "csv") {
             await new Promise((resolve, reject) => {
               fs.createReadStream(filePath)
                 .pipe(csv())
-                .on("data", (row) => {
-                  data.push(cleanObjectForBMData(row)); // Reusing cleanObjectForBMData for consistency
-                })
+                .on("data", (row) => data.push(cleanObjectForBMData(row)))
                 .on("end", resolve)
                 .on("error", reject);
             });
-          } else if (fileExtension === "xlsx" || fileExtension === "xls") {
-            const workbook = XLSX.readFile(filePath);
-            const sheet = workbook.Sheets[workbook.SheetNames[0]];
-            const rawData = XLSX.utils.sheet_to_json(sheet);
-            data = rawData.map(cleanObjectForBMData);
           } else {
-            return res.status(400).send({ message: "Invalid file format" });
+            const workbook = XLSX.readFile(filePath);
+            data = XLSX.utils
+              .sheet_to_json(workbook.Sheets[workbook.SheetNames[0]])
+              .map(cleanObjectForBMData);
           }
-
-          if (data.length === 0) {
-            console.warn("No data processed from file:", filePath);
-            return res
-              .status(400)
-              .send({ message: "No valid data found in file" });
-          }
-
           const result = await db.collection("StoreData").insertMany(data);
-
-          await fs.unlink(filePath);
+          await fs.promises.unlink(filePath);
           res.send({
-            message: "Store data uploaded successfully",
+            message: "Store data uploaded",
             insertedCount: result.insertedCount,
           });
         } catch (err) {
-          console.error("Store data upload error:", err);
-          res.status(500).send({
-            message: "Error uploading store data file",
-            error: err.message,
-          });
+          res.status(500).send({ message: "Error uploading store data" });
         }
       },
     );
 
-    // Endpoint to fetch StoreData
     app.post("/api/store-data", async (req, res) => {
       try {
-        if (!db) {
-          await connectToMongoDB();
-          if (!db)
-            return res.status(503).send({ message: "Database not connected" });
-        }
-
         const data = await db.collection("StoreData").find({}).toArray();
-
-        if (data.length === 0) {
-          return res.send({ storeData: [] });
-        }
-
-        // Dynamically collect all unique columns from the data
+        if (data.length === 0) return res.send({ storeData: [] });
         const allColumns = Array.from(
           new Set(data.flatMap((record) => Object.keys(record))),
         ).filter((col) => col !== "_id");
-
-        // Ensure 'NAME' and 'NO' appear first, if present
-        const priorityColumns = ["NAME", "NO"];
-        const finalColumns = [
-          ...priorityColumns.filter((col) => allColumns.includes(col)),
-          ...allColumns.filter(
-            (col) => !priorityColumns.includes(col) && col !== "_id",
-          ),
-        ];
-
-        const normalizedData = data.map((record) => {
-          const normalizedRecord = { _id: record._id.toString() };
-          finalColumns.forEach((col) => {
-            normalizedRecord[col] =
-              record[col] !== undefined ? record[col] : null;
-          });
-          return normalizedRecord;
+        res.send({
+          storeData: data.map((record) => {
+            const normalized = { _id: record._id.toString() };
+            allColumns.forEach(
+              (col) =>
+                (normalized[col] =
+                  record[col] !== undefined ? record[col] : null),
+            );
+            return normalized;
+          }),
         });
-
-        res.send({ storeData: normalizedData }); // Wrap the response in storeData
       } catch (err) {
-        console.error("Error fetching store data:", err);
         res.status(500).send({ message: "Error fetching store data" });
       }
     });
 
-    // Endpoint to delete StoreData
     app.post("/api/store-data-delete", async (req, res) => {
       try {
-        const { ids } = req.body;
-        if (!ids || !Array.isArray(ids) || ids.length === 0) {
-          return res.status(400).send({ message: "No valid IDs provided" });
-        }
-
-        const objectIds = ids
-          .map((id) => {
-            try {
-              return new ObjectId(id);
-            } catch (err) {
-              console.warn(`Invalid ObjectId skipped: ${id}`);
-              return null;
-            }
-          })
-          .filter((id) => id !== null);
-
-        if (objectIds.length === 0) {
-          return res
-            .status(400)
-            .send({ message: "No valid ObjectIds provided" });
-        }
-
-        const result = await db
-          .collection("StoreData")
-          .deleteMany({ _id: { $in: objectIds } });
-
+        const result = await db.collection("StoreData").deleteMany({
+          _id: { $in: req.body.ids.map((id) => new ObjectId(id)) },
+        });
         res.send({
-          message: "Data deleted successfully",
+          message: "Deleted successfully",
           deletedCount: result.deletedCount,
         });
       } catch (err) {
-        console.error("Error deleting store data:", err);
-        res.status(500).send({
-          message: "Error deleting store data",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error deleting" });
       }
     });
 
-    // Endpoint to add new StoreData
     app.post("/api/store-data-add", async (req, res) => {
       try {
-        const { data } = req.body;
-        if (!data || typeof data !== "object") {
-          return res.status(400).send({ message: "Invalid data provided" });
-        }
-
-        const cleanedData = cleanObjectForBMData(data);
-        if (Object.keys(cleanedData).length === 0) {
-          return res.status(400).send({ message: "No valid data to insert" });
-        }
-
-        const result = await db.collection("StoreData").insertOne(cleanedData);
-
+        const result = await db
+          .collection("StoreData")
+          .insertOne(cleanObjectForBMData(req.body.data));
         res.send({
-          message: "New store data added successfully",
-          insertedId: result.insertedId.toString(),
+          message: "Added successfully",
+          insertedId: result.insertedId,
         });
       } catch (err) {
-        console.error("Error adding store data:", err);
-        res.status(500).send({
-          message: "Error adding store data",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error adding" });
       }
     });
 
-    // Endpoint to update StoreData
     app.post("/api/store-data-update", async (req, res) => {
       try {
-        const { id, updates } = req.body;
-        if (!id || !updates) {
-          return res.status(400).send({ message: "Invalid update request" });
-        }
-
-        const cleanedUpdates = cleanObjectForBMData(updates);
         const result = await db
           .collection("StoreData")
-          .updateOne({ _id: new ObjectId(id) }, { $set: cleanedUpdates });
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ message: "Record not found" });
-        }
-        res.send({ message: "Data updated successfully" });
+          .updateOne(
+            { _id: new ObjectId(req.body.id) },
+            { $set: cleanObjectForBMData(req.body.updates) },
+          );
+        res.send({ message: "Updated successfully" });
       } catch (err) {
-        console.error("Error updating store data:", err);
-        res.status(500).send({ message: "Error updating store data" });
+        res.status(500).send({ message: "Error updating" });
       }
     });
 
     app.post("/api/bank-mapping-add", async (req, res) => {
       try {
-        const { data } = req.body;
-        if (!data || typeof data !== "object") {
-          return res.status(400).send({ message: "Invalid data provided" });
-        }
-
-        const cleanedData = cleanObjectForBMData(data);
-        if (Object.keys(cleanedData).length === 0) {
-          return res.status(400).send({ message: "No valid data to insert" });
-        }
-
-        const result = await db.collection("BMData").insertOne(cleanedData);
-
+        const result = await db
+          .collection("BMData")
+          .insertOne(cleanObjectForBMData(req.body.data));
         res.send({
-          message: "New bank mapping data added successfully",
-          insertedId: result.insertedId.toString(),
+          message: "Added successfully",
+          insertedId: result.insertedId,
         });
       } catch (err) {
-        console.error("Error adding bank mapping data:", err);
-        res.status(500).send({
-          message: "Error adding bank mapping data",
-          error: err.message,
-        });
+        res.status(500).send({ message: "Error adding bank mapping" });
       }
     });
 
     app.post("/api/bank-mapping-update", async (req, res) => {
       try {
-        const { id, updates } = req.body;
-        if (!id || !updates) {
-          return res.status(400).send({ message: "Invalid update request" });
-        }
-
-        const cleanedUpdates = cleanObjectForBMData(updates);
         const result = await db
           .collection("BMData")
-          .updateOne({ _id: new ObjectId(id) }, { $set: cleanedUpdates });
-        if (result.matchedCount === 0) {
-          return res.status(404).send({ message: "Record not found" });
-        }
-        res.send({ message: "Data updated successfully" });
+          .updateOne(
+            { _id: new ObjectId(req.body.id) },
+            { $set: cleanObjectForBMData(req.body.updates) },
+          );
+        res.send({ message: "Updated successfully" });
       } catch (err) {
-        console.error("Error updating data:", err);
-        res.status(500).send({ message: "Error updating data" });
+        res.status(500).send({ message: "Error updating bank mapping" });
       }
     });
 
-    app.get("/api/store-data", async (req, res) => {
+    app.get("/api/bofa-accounts", async (req, res) => {
       try {
-        if (!db) {
-          await connectToMongoDB();
-          if (!db) throw new Error("Failed to connect to MongoDB");
-        }
-
-        const storeData = await db
-          .collection("StoreData")
-          .find(
-            {},
+        if (!mongoClient) await connectToMongoDB();
+        const transactionsDb = mongoClient.db("Transactions");
+        const metadataDb = mongoClient.db("transactionsDB");
+        let accounts = await transactionsDb
+          .collection("bofa_transactions")
+          .aggregate([
             {
-              projection: {
-                NAME: 1,
-                NO: 1,
-                _id: 0,
+              $group: {
+                _id: "$accountNumber",
+                accountName: { $first: "$accountName" },
               },
             },
-          )
+            { $project: { _id: 0, accountNumber: "$_id", accountName: 1 } },
+          ])
           .toArray();
-
-        res.send({ storeData });
+        const mappings = await metadataDb
+          .collection("BMData")
+          .find({})
+          .project({
+            BankAccountNo1: 1,
+            BankAccountNo2: 1,
+            BankAccountNo3: 1,
+            BankAccountNo4: 1,
+            CompanyTaxName: 1,
+          })
+          .toArray();
+        accounts = accounts.map((acc) => {
+          if (acc.accountName) return acc;
+          const found = mappings.find((m) =>
+            [
+              m.BankAccountNo1,
+              m.BankAccountNo2,
+              m.BankAccountNo3,
+              m.BankAccountNo4,
+            ].some((bn) => String(bn).includes(String(acc.accountNumber))),
+          );
+          return {
+            accountNumber: acc.accountNumber,
+            accountName: found ? found.CompanyTaxName : "Unknown Entity",
+          };
+        });
+        res.send(
+          accounts.sort((a, b) =>
+            (a.accountName || "").localeCompare(b.accountName || ""),
+          ),
+        );
       } catch (err) {
-        console.error("Error fetching store data:", err);
-        res
-          .status(500)
-          .send({ message: "Error fetching store data", error: err.message });
+        res.status(500).send({ message: "Error fetching accounts" });
+      }
+    });
+
+    app.post("/api/bofa-data", async (req, res) => {
+      try {
+        if (!mongoClient) await connectToMongoDB();
+        const transactionsDb = mongoClient.db("Transactions");
+        const { accountNumbers, startDate, endDate } = req.body;
+        const data = await transactionsDb
+          .collection("bofa_transactions")
+          .find({
+            accountNumber: { $in: accountNumbers },
+            asOfDate: { $gte: startDate, $lte: endDate },
+          })
+          .sort({ accountNumber: 1, asOfDate: 1 })
+          .toArray();
+        res.send(data);
+      } catch (err) {
+        res.status(500).send({ message: "Error fetching bofa data" });
+      }
+    });
+
+    app.get("/api/due-to-due-mappings", async (req, res) => {
+      try {
+        const metadataDb = mongoClient.db("transactionsDB");
+        const data = await metadataDb.collection("DueToDueCompanies").find({}).toArray();
+        res.send(data);
+      } catch (err) {
+        res.status(500).send({ message: "Error fetching mappings", error: err.message });
+      }
+    });
+
+    app.post("/api/due-to-due-mappings", async (req, res) => {
+      try {
+        const metadataDb = mongoClient.db("transactionsDB");
+        const { canonical, variant, addedBy } = req.body;
+        const newMapping = {
+          canonical,
+          variant,
+          addedBy: addedBy || "Admin",
+          addedAt: new Date()
+        };
+        const result = await metadataDb.collection("DueToDueCompanies").insertOne(newMapping);
+        res.send({ message: "Added successfully", insertedId: result.insertedId });
+      } catch (err) {
+        res.status(500).send({ message: "Error adding mapping", error: err.message });
+      }
+    });
+
+    app.put("/api/due-to-due-mappings/:id", async (req, res) => {
+      try {
+        const metadataDb = mongoClient.db("transactionsDB");
+        const { canonical, variant, addedBy } = req.body;
+        const result = await metadataDb.collection("DueToDueCompanies").updateOne(
+          { _id: new ObjectId(req.params.id) },
+          { $set: { canonical, variant, addedBy: addedBy || "Admin", addedAt: new Date() } }
+        );
+        res.send({ message: "Updated successfully" });
+      } catch (err) {
+        res.status(500).send({ message: "Error updating mapping", error: err.message });
+      }
+    });
+
+    app.delete("/api/due-to-due-mappings/:id", async (req, res) => {
+      try {
+        const metadataDb = mongoClient.db("transactionsDB");
+        const result = await metadataDb.collection("DueToDueCompanies").deleteOne({ _id: new ObjectId(req.params.id) });
+        res.send({ message: "Deleted successfully", deletedCount: result.deletedCount });
+      } catch (err) {
+        res.status(500).send({ message: "Error deleting mapping", error: err.message });
       }
     });
 
     app.listen(port, () => {});
   })
   .catch((err) => {
-    console.error("Failed to start server:", err);
     process.exit(1);
   });
 
 process.on("SIGINT", async () => {
-  if (mongoClient) {
-    await mongoClient.close();
-  }
+  if (mongoClient) await mongoClient.close();
   process.exit(0);
 });
