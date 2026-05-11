@@ -13,22 +13,23 @@ import axios from "axios";
 dotenv.config();
 
 const app = express();
-app.use(express.json());
-const port = 3001;
 
 // CORS configuration
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept",
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
   );
+  res.header("Access-Control-Allow-Methods", "PUT, POST, PATCH, DELETE, GET, OPTIONS");
   if (req.method === "OPTIONS") {
-    res.header("Access-Control-Allow-Methods", "PUT, POST, PATCH, DELETE, GET");
-    return res.status(200).json({});
+    return res.status(200).end();
   }
   next();
 });
+
+app.use(express.json());
+const port = 3001;
 
 const mongoUrl = process.env.VITE_MONGO_URL;
 const dbName = "transactionsDB";
