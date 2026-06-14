@@ -10,7 +10,12 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import archiver from "archiver";
 import axios from "axios";
-dotenv.config();
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, ".env") });
 
 const app = express();
 
@@ -29,7 +34,7 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
-const port = 3001;
+const port = process.env.PORT || 3001;
 
 const mongoUrl = process.env.VITE_MONGO_URL;
 const dbName = "transactionsDB";
@@ -1238,185 +1243,234 @@ connectToMongoDB()
     app.post("/api/data-calculated-column", async (req, res) => {
       try {
         const { column, updates, isNewColumn, brand, username } = req.body;
+        if (!column || !Array.isArray(updates) || updates.length === 0 || !brand) {
+          return res.status(400).send({ message: "Invalid request: column, updates array, and brand are required" });
+        }
+
         const transactionId = uuidv4();
-        const transactionLog = {
-          transactionId,
-          brand,
-          operation: "calculated-column",
-          status: "active",
-          updates: [],
-          column,
-          isNewColumn,
-          createdAt: new Date(),
-        };
 
-        for (const update of updates) {
-          const { _id, value } = update;
-          const objectId = new ObjectId(_id);
-          const originalRecord = await brandsDb
-            .collection(brand)
-            .findOne(
-              { _id: objectId },
-              { projection: { [column]: 1, Date: 1, StoreName: 1 } },
-            );
-          const originalValue = originalRecord ? originalRecord[column] : null;
+        // ── STEP 1: Batch-read all original records in ONE query ──────────────
+        const objectIds = updates.map(({ _id }) => new ObjectId(_id));
+        const originalRecords = await brandsDb
+          .collection(brand)
+          .find(
+            { _id: { $in: objectIds } },
+            { projection: { [column]: 1, Date: 1, StoreName: 1 } }
+          )
+          .toArray();
 
-          // Log the calculation
-          await logToGoogleSheet({
-            username: username || "System",
-            brand: brand,
-            recordId: _id,
-            columnName: column,
-            oldValue: originalValue ?? "NULL",
-            newValue: value,
-            date: originalRecord?.Date,
-            store: originalRecord?.StoreName,
-          });
+        // Build a map for O(1) lookup: stringId -> record
+        const originalMap = new Map(
+          originalRecords.map((r) => [r._id.toString(), r])
+        );
 
-          transactionLog.updates.push({
+        // ── STEP 2: Build transaction log entries + bulkWrite ops ─────────────
+        const transactionLogUpdates = [];
+        const bulkOps = [];
+        const logPromises = []; // fire-and-forget: don't await each log
+
+        for (const { _id, value } of updates) {
+          const original = originalMap.get(_id);
+          const originalValue = original ? original[column] : null;
+
+          transactionLogUpdates.push({
             id: _id,
             originalValues: { [column]: originalValue },
             newValues: { [column]: value },
           });
-          await brandsDb
-            .collection(brand)
-            .updateOne({ _id: objectId }, { $set: { [column]: value } });
+
+          bulkOps.push({
+            updateOne: {
+              filter: { _id: new ObjectId(_id) },
+              update: { $set: { [column]: value } },
+            },
+          });
+
+          // Fire Google Sheet log without awaiting — never blocks the response
+          if (String(originalValue) !== String(value)) {
+            logPromises.push(
+              logToGoogleSheet({
+                username: username || "System",
+                brand,
+                recordId: _id,
+                columnName: column,
+                oldValue: originalValue ?? "NULL",
+                newValue: value,
+                date: original?.Date,
+                store: original?.StoreName,
+              })
+            );
+          }
         }
 
-        await db.collection("TransactionLog").insertOne(transactionLog);
-        res.send({ message: `Column '${column}' processed`, transactionId });
+        // ── STEP 3: Write everything in parallel ──────────────────────────────
+        const [bulkResult] = await Promise.all([
+          // Single bulkWrite replaces N sequential updateOne calls
+          bulkOps.length > 0
+            ? brandsDb.collection(brand).bulkWrite(bulkOps, { ordered: false })
+            : Promise.resolve({ modifiedCount: 0 }),
+          // Transaction log insert
+          db.collection("TransactionLog").insertOne({
+            transactionId,
+            brand,
+            operation: "calculated-column",
+            status: "active",
+            updates: transactionLogUpdates,
+            column,
+            isNewColumn,
+            createdAt: new Date(),
+          }),
+        ]);
+
+        // Google Sheet logs run in background — don't block the response
+        Promise.allSettled(logPromises).catch(console.error);
+
+        res.status(200).send({
+          message: `Column '${column}' updated for ${bulkResult.modifiedCount} records`,
+          transactionId,
+          modifiedCount: bulkResult.modifiedCount,
+        });
       } catch (err) {
-        res.status(500).send({ message: "Error processing calculated column" });
+        console.error("Error processing calculated column:", err);
+        res.status(500).send({ message: "Error processing calculated column", error: err.message });
       }
     });
 
     app.post("/api/undo", async (req, res) => {
       try {
-        const { brand, username } = req.body; // username from frontend
-        if (!brand)
-          return res.status(400).send({ message: "Brand is required" });
+        const { brand, username } = req.body;
+        if (!brand) return res.status(400).send({ message: "Brand is required" });
 
         const transaction = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "active" }, { sort: { createdAt: -1 } });
 
-        if (!transaction)
-          return res.status(404).send({ message: "No actions to undo" });
+        if (!transaction) return res.status(404).send({ message: "No actions to undo" });
+
+        // ── Batch-read current states in ONE query ────────────────────────────
+        const ids = transaction.updates.map((u) => new ObjectId(u.id));
+        const currentStates = await brandsDb
+          .collection(brand)
+          .find({ _id: { $in: ids } })
+          .toArray();
+        const currentMap = new Map(currentStates.map((s) => [s._id.toString(), s]));
 
         const bulkOps = [];
-        for (const update of transaction.updates) {
-          const { id, originalValues } = update;
-          const objectId = new ObjectId(id);
+        const logPromises = [];
 
-          // Fetch current state before reverting to log the change
-          const currentState = await brandsDb
-            .collection(brand)
-            .findOne({ _id: objectId });
-
+        for (const { id, originalValues } of transaction.updates) {
+          const currentState = currentMap.get(id);
           if (currentState) {
             for (const key in originalValues) {
               const oldValue = currentState[key];
               const newValue = originalValues[key];
-
               if (String(oldValue) !== String(newValue)) {
-                await logToGoogleSheet({
-                  username: username || "System (Undo)",
-                  brand: brand,
-                  recordId: id,
-                  columnName: key + " (UNDO)", // Mark as undo
-                  oldValue: oldValue ?? "NULL",
-                  newValue: newValue ?? "NULL",
-                  date: currentState.Date,
-                  store: currentState.StoreName,
-                });
+                logPromises.push(
+                  logToGoogleSheet({
+                    username: username || "System (Undo)",
+                    brand,
+                    recordId: id,
+                    columnName: key + " (UNDO)",
+                    oldValue: oldValue ?? "NULL",
+                    newValue: newValue ?? "NULL",
+                    date: currentState.Date,
+                    store: currentState.StoreName,
+                  })
+                );
               }
             }
           }
-
           bulkOps.push({
             updateOne: {
-              filter: { _id: objectId },
+              filter: { _id: new ObjectId(id) },
               update: { $set: originalValues },
             },
           });
         }
 
-        const result = await brandsDb.collection(brand).bulkWrite(bulkOps);
-        await db
-          .collection("TransactionLog")
-          .updateOne(
+        const [result] = await Promise.all([
+          brandsDb.collection(brand).bulkWrite(bulkOps, { ordered: false }),
+          db.collection("TransactionLog").updateOne(
             { transactionId: transaction.transactionId },
-            { $set: { status: "undone" } },
-          );
-        res.send({
-          message: "Undo completed and logged",
-          modifiedCount: result.modifiedCount,
-        });
+            { $set: { status: "undone" } }
+          ),
+        ]);
+
+        Promise.allSettled(logPromises).catch(console.error);
+
+        res.send({ message: "Undo completed and logged", modifiedCount: result.modifiedCount });
       } catch (err) {
-        res.status(500).send({ message: "Error performing undo" });
+        console.error("Undo error:", err);
+        res.status(500).send({ message: "Error performing undo", error: err.message });
       }
     });
 
     app.post("/api/redo", async (req, res) => {
       try {
         const { brand, username } = req.body;
+        if (!brand) return res.status(400).send({ message: "Brand is required" });
+
         const transaction = await db
           .collection("TransactionLog")
           .findOne({ brand, status: "undone" }, { sort: { createdAt: -1 } });
 
-        if (!transaction)
-          return res.status(404).send({ message: "No actions to redo" });
+        if (!transaction) return res.status(404).send({ message: "No actions to redo" });
+
+        // ── Batch-read current states in ONE query ────────────────────────────
+        const ids = transaction.updates.map((u) => new ObjectId(u.id));
+        const currentStates = await brandsDb
+          .collection(brand)
+          .find({ _id: { $in: ids } })
+          .toArray();
+        const currentMap = new Map(currentStates.map((s) => [s._id.toString(), s]));
 
         const bulkOps = [];
-        for (const update of transaction.updates) {
-          const { id, newValues } = update;
-          const objectId = new ObjectId(id);
+        const logPromises = [];
 
-          const currentState = await brandsDb
-            .collection(brand)
-            .findOne({ _id: objectId });
-
+        for (const { id, newValues } of transaction.updates) {
+          const currentState = currentMap.get(id);
           if (currentState) {
             for (const key in newValues) {
               const oldValue = currentState[key];
               const newValue = newValues[key];
-
               if (String(oldValue) !== String(newValue)) {
-                await logToGoogleSheet({
-                  username: username || "System (Redo)",
-                  brand: brand,
-                  recordId: id,
-                  columnName: key + " (REDO)", // Mark as redo
-                  oldValue: oldValue ?? "NULL",
-                  newValue: newValue ?? "NULL",
-                  date: currentState.Date,
-                  store: currentState.StoreName,
-                });
+                logPromises.push(
+                  logToGoogleSheet({
+                    username: username || "System (Redo)",
+                    brand,
+                    recordId: id,
+                    columnName: key + " (REDO)",
+                    oldValue: oldValue ?? "NULL",
+                    newValue: newValue ?? "NULL",
+                    date: currentState.Date,
+                    store: currentState.StoreName,
+                  })
+                );
               }
             }
           }
-
           bulkOps.push({
             updateOne: {
-              filter: { _id: objectId },
+              filter: { _id: new ObjectId(id) },
               update: { $set: newValues },
             },
           });
         }
 
-        const result = await brandsDb.collection(brand).bulkWrite(bulkOps);
-        await db
-          .collection("TransactionLog")
-          .updateOne(
+        const [result] = await Promise.all([
+          brandsDb.collection(brand).bulkWrite(bulkOps, { ordered: false }),
+          db.collection("TransactionLog").updateOne(
             { transactionId: transaction.transactionId },
-            { $set: { status: "active" } },
-          );
-        res.send({
-          message: "Redo completed and logged",
-          modifiedCount: result.modifiedCount,
-        });
+            { $set: { status: "active" } }
+          ),
+        ]);
+
+        Promise.allSettled(logPromises).catch(console.error);
+
+        res.send({ message: "Redo completed and logged", modifiedCount: result.modifiedCount });
       } catch (err) {
-        res.status(500).send({ message: "Error performing redo" });
+        console.error("Redo error:", err);
+        res.status(500).send({ message: "Error performing redo", error: err.message });
       }
     });
 
