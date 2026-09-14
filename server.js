@@ -995,24 +995,30 @@ connectToMongoDB()
           dateStrings.push(cur.format("MM-DD-YYYY"));
         }
 
-        const data = await brandsDb
-          .collection(brand)
-          .find({ Date: { $in: dateStrings } })
-          .toArray();
+        const filter = { Date: { $in: dateStrings } };
 
-        if (data.length === 0) {
+        // First pass: figure out the full column set and total count without
+        // ever holding more than one document in memory at a time. Building
+        // the whole result set into an array (and then JSON.stringify-ing
+        // that array in one shot) is what was blowing the heap on large
+        // fetches - a giant temporary array plus a giant temporary string,
+        // both alive at once.
+        const columnSet = new Set();
+        let count = 0;
+        const countCursor = brandsDb.collection(brand).find(filter);
+        for await (const record of countCursor) {
+          count++;
+          for (const key of Object.keys(record)) {
+            if (key !== "_id") columnSet.add(key);
+          }
+        }
+
+        if (count === 0) {
           return res.status(200).json({
             success: true,
             data: [],
             message: "No records found in selected date range",
           });
-        }
-
-        const columnSet = new Set();
-        for (const record of data) {
-          for (const key of Object.keys(record)) {
-            if (key !== "_id") columnSet.add(key);
-          }
         }
 
         const priorityColumns = ["StoreName", "Date"];
@@ -1021,11 +1027,15 @@ connectToMongoDB()
           ...[...columnSet].filter((col) => !priorityColumns.includes(col)),
         ];
 
-        // Normalize in place (rather than building a second full array) so each
-        // original record can be garbage-collected as we go instead of holding
-        // two full copies of a potentially huge dataset in memory at once.
-        for (let i = 0; i < data.length; i++) {
-          const record = data[i];
+        // Second pass: stream each normalized record straight to the socket
+        // as it comes off the cursor, so peak memory stays proportional to
+        // one record instead of the entire result set.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write(`{"success":true,"count":${count},"data":[`);
+
+        let isFirst = true;
+        const dataCursor = brandsDb.collection(brand).find(filter);
+        for await (const record of dataCursor) {
           const normalizedRecord = { _id: record._id.toString() };
           for (const col of finalColumns) {
             normalizedRecord[col] =
@@ -1033,21 +1043,23 @@ connectToMongoDB()
                 ? record[col]
                 : null;
           }
-          data[i] = normalizedRecord;
+          res.write((isFirst ? "" : ",") + JSON.stringify(normalizedRecord));
+          isFirst = false;
         }
 
-        res.status(200).json({
-          success: true,
-          data,
-          count: data.length,
-        });
+        res.write("]}");
+        res.end();
       } catch (err) {
         console.error("[ /api/data ] Error:", err);
-        res.status(500).json({
-          success: false,
-          message: "Internal server error while fetching data",
-          error: err.message,
-        });
+        if (!res.headersSent) {
+          res.status(500).json({
+            success: false,
+            message: "Internal server error while fetching data",
+            error: err.message,
+          });
+        } else {
+          res.end();
+        }
       }
     });
 
