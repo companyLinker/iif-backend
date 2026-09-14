@@ -19,6 +19,17 @@ dotenv.config({ path: path.resolve(__dirname, ".env") });
 
 const app = express();
 
+// A bug in any single request handler (e.g. writing to a client that has
+// already disconnected) can otherwise throw an unhandled rejection, which
+// Node treats as fatal by default - crashing this process and every other
+// user's in-flight request along with it. Log and keep running instead.
+process.on("unhandledRejection", (reason) => {
+  console.error("[ unhandledRejection ]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[ uncaughtException ]", err);
+});
+
 // CORS configuration
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -1080,7 +1091,16 @@ connectToMongoDB()
             error: err.message,
           });
         } else {
-          res.end();
+          // A disconnected client (closed tab, network drop, etc.) can leave
+          // the response stream already destroyed by the time we get here,
+          // and calling end() on it throws. That must never escape this
+          // handler uncaught - an unhandled rejection here crashes the
+          // entire Node process for every user, not just this one request.
+          try {
+            res.end();
+          } catch (_) {
+            // client already gone; nothing more to do
+          }
         }
       }
     });
