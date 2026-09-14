@@ -61,6 +61,7 @@ let db;
 let brandsDb;
 let transactionsRef;
 let mongoClient;
+const dateIndexedBrands = new Set();
 
 // Google Sheets Logging Function
 const logToGoogleSheet = async (logData) => {
@@ -975,41 +976,28 @@ connectToMongoDB()
           });
         }
 
-        const startOfDay = start.startOf("day").toDate();
-        const endOfDay = end.endOf("day").toDate();
+        // Stored Date values are zero-padded "MM-DD-YYYY" strings (see upload
+        // parsing), so we can match them directly against an indexed field
+        // instead of running $dateFromString on every document in the
+        // collection on every request (that full-collection-scan approach is
+        // what was causing large fetches to be extremely slow/timeout).
+        if (!dateIndexedBrands.has(brand)) {
+          await brandsDb.collection(brand).createIndex({ Date: 1 });
+          dateIndexedBrands.add(brand);
+        }
 
-        const pipeline = [
-          {
-            $addFields: {
-              __parsedDate: {
-                $dateFromString: {
-                  dateString: "$Date",
-                  format: "%m-%d-%Y",
-                  onError: null,
-                  onNull: null,
-                },
-              },
-            },
-          },
-          {
-            $match: {
-              __parsedDate: { $ne: null },
-              __parsedDate: {
-                $gte: startOfDay,
-                $lte: endOfDay,
-              },
-            },
-          },
-          {
-            $project: {
-              __parsedDate: 0,
-            },
-          },
-        ];
+        const dateStrings = [];
+        for (
+          let cur = start.clone().startOf("day");
+          cur.isSameOrBefore(end, "day");
+          cur.add(1, "day")
+        ) {
+          dateStrings.push(cur.format("MM-DD-YYYY"));
+        }
 
         const data = await brandsDb
           .collection(brand)
-          .aggregate(pipeline)
+          .find({ Date: { $in: dateStrings } })
           .toArray();
 
         if (data.length === 0) {
