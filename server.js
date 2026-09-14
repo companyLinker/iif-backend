@@ -1015,6 +1015,7 @@ connectToMongoDB()
         // field names comes back over the network instead of every matching
         // document's full contents - that's what made the previous two-pass
         // version (fetch everything, twice) take 8+ minutes for ~80MB.
+        console.time(`[/api/data] metadata ${brand}`);
         const [count, columnAgg] = await Promise.all([
           brandsDb.collection(brand).countDocuments(filter),
           brandsDb
@@ -1027,6 +1028,8 @@ connectToMongoDB()
             ])
             .toArray(),
         ]);
+        console.timeEnd(`[/api/data] metadata ${brand}`);
+        console.log(`[/api/data] count=${count}`);
         const columnSet = new Set(
           (columnAgg[0]?.keys || []).filter((k) => k !== "_id"),
         );
@@ -1064,7 +1067,9 @@ connectToMongoDB()
         res.writeHead(200, { "Content-Type": "application/json" });
         await writeChunk(`{"success":true,"count":${count},"data":[`);
 
+        console.time(`[/api/data] stream ${brand}`);
         let isFirst = true;
+        let streamed = 0;
         const dataCursor = brandsDb.collection(brand).find(filter);
         for await (const record of dataCursor) {
           const normalizedRecord = { _id: record._id.toString() };
@@ -1078,10 +1083,15 @@ connectToMongoDB()
             (isFirst ? "" : ",") + JSON.stringify(normalizedRecord),
           );
           isFirst = false;
+          streamed++;
+          if (streamed % 10000 === 0) {
+            console.log(`[/api/data] streamed ${streamed}/${count}`);
+          }
         }
 
         await writeChunk("]}");
         res.end();
+        console.timeEnd(`[/api/data] stream ${brand}`);
       } catch (err) {
         console.error("[ /api/data ] Error:", err);
         if (!res.headersSent) {
