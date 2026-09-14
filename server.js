@@ -997,21 +997,28 @@ connectToMongoDB()
 
         const filter = { Date: { $in: dateStrings } };
 
-        // First pass: figure out the full column set and total count without
-        // ever holding more than one document in memory at a time. Building
-        // the whole result set into an array (and then JSON.stringify-ing
-        // that array in one shot) is what was blowing the heap on large
-        // fetches - a giant temporary array plus a giant temporary string,
-        // both alive at once.
-        const columnSet = new Set();
-        let count = 0;
-        const countCursor = brandsDb.collection(brand).find(filter);
-        for await (const record of countCursor) {
-          count++;
-          for (const key of Object.keys(record)) {
-            if (key !== "_id") columnSet.add(key);
-          }
-        }
+        // Figure out the total count and the full column set without ever
+        // pulling full documents across the wire twice. countDocuments uses
+        // the Date index directly (no document fetch), and the column list
+        // is computed inside MongoDB via aggregation so only a short list of
+        // field names comes back over the network instead of every matching
+        // document's full contents - that's what made the previous two-pass
+        // version (fetch everything, twice) take 8+ minutes for ~80MB.
+        const [count, columnAgg] = await Promise.all([
+          brandsDb.collection(brand).countDocuments(filter),
+          brandsDb
+            .collection(brand)
+            .aggregate([
+              { $match: filter },
+              { $project: { arr: { $objectToArray: "$$ROOT" } } },
+              { $unwind: "$arr" },
+              { $group: { _id: null, keys: { $addToSet: "$arr.k" } } },
+            ])
+            .toArray(),
+        ]);
+        const columnSet = new Set(
+          (columnAgg[0]?.keys || []).filter((k) => k !== "_id"),
+        );
 
         if (count === 0) {
           return res.status(200).json({
