@@ -1020,31 +1020,38 @@ connectToMongoDB()
           });
         }
 
-        const allColumns = Array.from(
-          new Set(data.flatMap((record) => Object.keys(record))),
-        ).filter((col) => col !== "_id");
+        const columnSet = new Set();
+        for (const record of data) {
+          for (const key of Object.keys(record)) {
+            if (key !== "_id") columnSet.add(key);
+          }
+        }
 
         const priorityColumns = ["StoreName", "Date"];
         const finalColumns = [
-          ...priorityColumns.filter((col) => allColumns.includes(col)),
-          ...allColumns.filter((col) => !priorityColumns.includes(col)),
+          ...priorityColumns.filter((col) => columnSet.has(col)),
+          ...[...columnSet].filter((col) => !priorityColumns.includes(col)),
         ];
 
-        const normalizedData = data.map((record) => {
+        // Normalize in place (rather than building a second full array) so each
+        // original record can be garbage-collected as we go instead of holding
+        // two full copies of a potentially huge dataset in memory at once.
+        for (let i = 0; i < data.length; i++) {
+          const record = data[i];
           const normalizedRecord = { _id: record._id.toString() };
-          finalColumns.forEach((col) => {
+          for (const col of finalColumns) {
             normalizedRecord[col] =
               record[col] !== undefined && record[col] !== null
                 ? record[col]
                 : null;
-          });
-          return normalizedRecord;
-        });
+          }
+          data[i] = normalizedRecord;
+        }
 
         res.status(200).json({
           success: true,
-          data: normalizedData,
-          count: normalizedData.length,
+          data,
+          count: data.length,
         });
       } catch (err) {
         console.error("[ /api/data ] Error:", err);
