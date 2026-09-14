@@ -1027,11 +1027,24 @@ connectToMongoDB()
           ...[...columnSet].filter((col) => !priorityColumns.includes(col)),
         ];
 
+        // Writes past the socket's OS buffer just queue up inside the Node
+        // process, so a plain res.write() loop still buffers the whole
+        // result set in memory if the cursor produces records faster than
+        // the client can drain them - it isn't real streaming. Waiting on
+        // "drain" whenever write() reports backpressure caps memory at a
+        // small, bounded amount regardless of dataset size.
+        const writeChunk = (chunk) =>
+          new Promise((resolve, reject) => {
+            const ok = res.write(chunk, (err) => (err ? reject(err) : undefined));
+            if (ok) resolve();
+            else res.once("drain", resolve);
+          });
+
         // Second pass: stream each normalized record straight to the socket
-        // as it comes off the cursor, so peak memory stays proportional to
-        // one record instead of the entire result set.
+        // as it comes off the cursor, so peak memory stays bounded instead
+        // of proportional to the entire result set.
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.write(`{"success":true,"count":${count},"data":[`);
+        await writeChunk(`{"success":true,"count":${count},"data":[`);
 
         let isFirst = true;
         const dataCursor = brandsDb.collection(brand).find(filter);
@@ -1043,11 +1056,13 @@ connectToMongoDB()
                 ? record[col]
                 : null;
           }
-          res.write((isFirst ? "" : ",") + JSON.stringify(normalizedRecord));
+          await writeChunk(
+            (isFirst ? "" : ",") + JSON.stringify(normalizedRecord),
+          );
           isFirst = false;
         }
 
-        res.write("]}");
+        await writeChunk("]}");
         res.end();
       } catch (err) {
         console.error("[ /api/data ] Error:", err);
