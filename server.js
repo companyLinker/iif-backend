@@ -1042,10 +1042,22 @@ connectToMongoDB()
           });
         }
 
+        // $addToSet gives no ordering guarantee, so take the remaining column
+        // order from a stored document (raw key order) and append any keys
+        // that only appear in other documents.
+        const sampleDoc = await brandsDb.collection(brand).findOne(filter);
+        const rawOrder = sampleDoc
+          ? Object.keys(sampleDoc).filter((k) => columnSet.has(k))
+          : [];
+        const orderedColumns = [
+          ...rawOrder,
+          ...[...columnSet].filter((col) => !rawOrder.includes(col)),
+        ];
+
         const priorityColumns = ["StoreName", "Date"];
         const finalColumns = [
           ...priorityColumns.filter((col) => columnSet.has(col)),
-          ...[...columnSet].filter((col) => !priorityColumns.includes(col)),
+          ...orderedColumns.filter((col) => !priorityColumns.includes(col)),
         ];
 
         // Writes past the socket's OS buffer just queue up inside the Node
