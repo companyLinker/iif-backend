@@ -25,6 +25,16 @@ const DATE_FORMATS = [
   "MMMM D, YYYY",
   "D-MMM-YY",
   "D-MMM-YYYY",
+  "DD-MMM-YY",
+  "DD-MMM-YYYY",
+  "MMM DD, YYYY",
+  "MMM-DD-YYYY",
+  "YYYYMMDD",
+  "M.D.YYYY",
+  "MM.DD.YYYY",
+  "YYYY.MM.DD",
+  "D MMM YYYY",
+  "DD MMM YYYY",
 ];
 
 export function cleanObjectForSampleData(obj) {
@@ -47,7 +57,20 @@ export function cleanObjectForSampleData(obj) {
     }
 
     if (cleanKey.toLowerCase() === "date") {
-      if (typeof value === "number") {
+      // "46083" (a CSV export of an Excel date) is a serial number, not text
+      if (typeof value === "string" && /^\d{5}(\.\d+)?$/.test(value)) {
+        value = Number(value);
+      }
+      if (
+        typeof value === "number" &&
+        Number.isInteger(value) &&
+        value >= 19000101 &&
+        value <= 20991231
+      ) {
+        // 20260901 style
+        const ymd = moment(String(value), "YYYYMMDD", true);
+        value = ymd.isValid() ? ymd.format("MM-DD-YYYY") : null;
+      } else if (typeof value === "number") {
         const excelEpoch = new Date(Date.UTC(1899, 11, 31));
         const utcDate = new Date(excelEpoch.getTime() + (value - 1) * 86400000);
         value = moment.utc(utcDate).format("MM-DD-YYYY");
@@ -153,27 +176,156 @@ export function detectHeaderRow(rows) {
   return -1;
 }
 
+// ── Content based detection ──────────────────────────────────────────────────
+// Column names cannot be trusted ("Date", "DATE", "Business Day", "Col A"...),
+// so what a column *contains* decides whether it is the date or the store.
+
+const SERIAL_MIN = 42005; // Excel serial for 2015-01-01
+const SERIAL_MAX = 49674; // ... 2035-12-31
+const DATE_HINT = /date|day|period|dt|time|business|when/;
+const METRIC_WORDS = /sales|tax|amount|total|count|tip|fee|price|cost|discount|refund|qty|quantity/;
+
+const isEmptyCell = (v) => v === null || v === undefined || String(v).trim() === "";
+
+function isDateLike(value, headerHint = false) {
+  if (isEmptyCell(value)) return false;
+  if (value instanceof Date) return !isNaN(value);
+  if (typeof value === "number") {
+    if (Number.isInteger(value)) {
+      if (value >= SERIAL_MIN && value <= SERIAL_MAX) return true;
+      return (
+        value >= 20150101 &&
+        value <= 20351231 &&
+        moment(String(value), "YYYYMMDD", true).isValid()
+      );
+    }
+    // a decimal (date with a time part) is only believed with a date-ish header
+    return headerHint && value >= SERIAL_MIN && value < SERIAL_MAX + 1;
+  }
+  const text = String(value).trim();
+  if (/^\d{5}(\.\d+)?$/.test(text)) {
+    const n = Number(text);
+    return headerHint && n >= SERIAL_MIN && n <= SERIAL_MAX;
+  }
+  return moment(text, DATE_FORMATS, true).isValid();
+}
+
+const columnSample = (dataRows, c, limit = 200) => {
+  const out = [];
+  for (const row of dataRows) {
+    const v = row?.[c];
+    if (!isEmptyCell(v)) out.push(v);
+    if (out.length >= limit) break;
+  }
+  return out;
+};
+
+// The date column: an obvious "Date" header wins; otherwise the column whose
+// values are (nearly) all dates, preferring one whose header also looks like a date.
+function findDateColumn(headerCells, dataRows) {
+  const normalized = headerCells.map(normKey);
+  const exact = findAliasIndex(normalized, DATE_ALIASES);
+  if (exact !== -1) return exact;
+
+  let best = -1;
+  let bestScore = 0;
+  for (let c = 0; c < headerCells.length; c++) {
+    const sample = columnSample(dataRows, c);
+    if (sample.length === 0) continue;
+    const hint = DATE_HINT.test(normalized[c]);
+    const ratio = sample.filter((v) => isDateLike(v, hint)).length / sample.length;
+    if (ratio < 0.8) continue;
+    const score = ratio + (hint ? 0.5 : 0);
+    if (score > bestScore) {
+      best = c;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+// Header row when no header says "date": the first mostly-text row that sits
+// directly above rows with a column full of dates.
+export function detectHeaderRowByContent(rows) {
+  const limit = Math.min(rows.length - 1, HEADER_SCAN_ROWS);
+  for (let r = 0; r < limit; r++) {
+    const cells = rows[r] || [];
+    const filled = cells.filter((v) => !isEmptyCell(v));
+    if (filled.length < 2) continue;
+    const textual = filled.filter(
+      (v) => typeof v === "string" && isNaN(Number(v)) && !isDateLike(v),
+    ).length;
+    if (textual / filled.length < 0.8) continue;
+
+    const body = rows.slice(r + 1, r + 9).filter((row) => !isBlankRow(row));
+    if (body.length === 0) continue;
+    const width = Math.max(cells.length, ...body.map((b) => b.length));
+    for (let c = 0; c < width; c++) {
+      const values = body.map((b) => b[c]).filter((v) => !isEmptyCell(v));
+      if (values.length < Math.ceil(body.length * 0.8)) continue;
+      const hint = DATE_HINT.test(normKey(cells[c]));
+      const dates = values.filter((v) => isDateLike(v, hint)).length;
+      if (dates / values.length >= 0.8) return r;
+    }
+  }
+  return -1;
+}
+
 // Decides which header is the store name, which is the store id and which is
 // the date. A weakly-named column ("Store", "Location") whose values are mostly
-// ids we know is treated as an id column, not a name.
+// ids we know is treated as an id column, not a name. When no header names a
+// store at all, a header that merely starts with "store"/"location" is used, and
+// as a last resort the column whose values are known store ids or names.
 export function locateColumns(headerCells, dataRows = [], idToName = new Map()) {
   const normalized = headerCells.map(normKey);
-  const dateIdx = findAliasIndex(normalized, DATE_ALIASES);
+  const dateIdx = findDateColumn(headerCells, dataRows);
   const exactNameIdx = normalized.indexOf("storename");
   let nameIdx = exactNameIdx !== -1 ? exactNameIdx : findAliasIndex(normalized, STORE_ALIASES);
   let idIdx = findAliasIndex(normalized, STORE_ID_ALIASES);
 
   if (exactNameIdx === -1 && nameIdx !== -1 && idToName.size > 0) {
-    const sample = [];
-    for (const row of dataRows) {
-      const v = row?.[nameIdx];
-      if (v !== null && v !== undefined && String(v).trim() !== "") sample.push(v);
-      if (sample.length >= 50) break;
-    }
+    const sample = columnSample(dataRows, nameIdx, 50);
     const known = sample.filter((v) => idToName.has(normId(v))).length;
     if (sample.length > 0 && known / sample.length >= 0.5 && idIdx === -1) {
       idIdx = nameIdx;
       nameIdx = -1;
+    }
+  }
+
+  if (nameIdx === -1 && idIdx === -1) {
+    for (let c = 0; c < normalized.length; c++) {
+      const n = normalized[c];
+      if (c === dateIdx || !/^(store|location|restaurant|shop|branch)/.test(n)) continue;
+      if (METRIC_WORDS.test(n)) continue;
+      if (/(number|num|no|id|code)/.test(n.replace(/^(store|location|restaurant|shop|branch)/, ""))) {
+        if (idIdx === -1) idIdx = c;
+      } else if (nameIdx === -1) {
+        nameIdx = c;
+      }
+    }
+  }
+
+  if (nameIdx === -1 && idIdx === -1 && idToName.size > 0) {
+    const knownNames = new Set([...idToName.values()].map((v) => String(v).trim().toLowerCase()));
+    let bestRatio = 0;
+    for (let c = 0; c < normalized.length; c++) {
+      if (c === dateIdx) continue;
+      const sample = columnSample(dataRows, c, 100);
+      if (sample.length === 0) continue;
+      const idRatio = sample.filter((v) => idToName.has(normId(v))).length / sample.length;
+      const nameRatio =
+        sample.filter((v) => knownNames.has(String(v).trim().toLowerCase())).length /
+        sample.length;
+      if (Math.max(idRatio, nameRatio) >= 0.6 && Math.max(idRatio, nameRatio) > bestRatio) {
+        bestRatio = Math.max(idRatio, nameRatio);
+        if (nameRatio >= idRatio) {
+          nameIdx = c;
+          idIdx = -1;
+        } else {
+          idIdx = c;
+          nameIdx = -1;
+        }
+      }
     }
   }
   return { nameIdx, idIdx, dateIdx };
@@ -260,6 +412,7 @@ export function extractRecords(sheets, knownColumns = new Map(), idToName = new 
     if (!rows || rows.length === 0) continue;
 
     let headerRow = detectHeaderRow(rows);
+    if (headerRow === -1) headerRow = detectHeaderRowByContent(rows);
     if (headerRow === -1) {
       sheetsWithoutHeader.push(sheetName);
       headerRow = rows.findIndex((r) => !isBlankRow(r));
