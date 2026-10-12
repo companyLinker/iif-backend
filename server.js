@@ -12,6 +12,14 @@ import archiver from "archiver";
 import axios from "axios";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  cleanObjectForSampleData,
+  readUploadedFile,
+  extractRecords,
+  loadKnownColumns,
+  storeRecords,
+  withBrandLock,
+} from "./uploadProcessing.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,7 +68,11 @@ const upload = multer({
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       "application/vnd.ms-excel",
     ];
-    if (allowedTypes.includes(file.mimetype)) {
+    const ext = file.originalname.split(".").pop().toLowerCase();
+    if (
+      allowedTypes.includes(file.mimetype) ||
+      ["csv", "xlsx", "xls"].includes(ext)
+    ) {
       cb(null, true);
     } else {
       cb(new Error("Only CSV, XLSX, and XLS files are allowed"));
@@ -125,58 +137,6 @@ async function connectToMongoDB() {
     mongoClient = null;
     throw err;
   }
-}
-
-function cleanObjectForSampleData(obj) {
-  return Object.keys(obj).reduce((acc, key) => {
-    const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
-    let value = obj[key];
-
-    if (typeof value === "string") {
-      value = value.trim().replace(/\x00/g, "");
-      if (cleanKey.toLowerCase() !== "date") {
-        const parsedNumber = parseFloat(value.replace(/[^0-9.-]/g, ""));
-        if (!isNaN(parsedNumber) && value.match(/^-?\d*\.?\d*$/)) {
-          value = Number(parsedNumber.toFixed(2));
-        }
-      }
-    } else if (typeof value === "number" && !isNaN(value)) {
-      value = Number(value.toFixed(2));
-    } else if (value === null || value === undefined) {
-      value = null;
-    }
-
-    if (cleanKey.toLowerCase() === "date") {
-      if (typeof value === "number") {
-        const excelEpoch = new Date(Date.UTC(1899, 11, 31));
-        const utcDate = new Date(excelEpoch.getTime() + (value - 1) * 86400000);
-        value = moment.utc(utcDate).format("MM-DD-YYYY");
-      } else if (value) {
-        const parsedDate = moment(
-          String(value),
-          [
-            "MM-DD-YYYY",
-            "MM/DD/YYYY",
-            "YYYY-MM-DD",
-            "DD-MM-YYYY",
-            "DD/MM/YYYY",
-            "M/D/YYYY",
-            "MM-DD-YY",
-            "M-D-YYYY",
-          ],
-          true,
-        );
-        if (parsedDate.isValid()) {
-          value = parsedDate.format("MM-DD-YYYY");
-        } else {
-          value = null;
-        }
-      }
-    }
-
-    acc[cleanKey] = value;
-    return acc;
-  }, {});
 }
 
 async function initializeTransactionLog() {
@@ -790,134 +750,114 @@ connectToMongoDB()
         }
 
         if (!brandsDb) await connectToMongoDB();
+        const collection = brandsDb.collection(brand);
 
-        await brandsDb.collection(brand).createIndex({ StoreName: 1, Date: 1 });
+        const summary = await withBrandLock(brand, async () => {
+          await collection.createIndex({ StoreName: 1, Date: 1 });
+          await collection.createIndex({ Date: 1 });
+          const knownColumns = await loadKnownColumns(collection);
 
-        let totalInserted = 0;
-        let totalDuplicates = 0;
-        let totalSheets = 0;
+          const totals = {
+            inserted: 0,
+            duplicates: 0,
+            updated: 0,
+            sheets: 0,
+            skippedMissingStoreName: 0,
+            skippedMissingOrInvalidDate: 0,
+            skippedSamples: [],
+            detectedColumns: [],
+            errors: [],
+          };
 
-        const BATCH_SIZE = 1000;
+          for (const file of req.files) {
+            const extension = file.originalname.split(".").pop().toLowerCase();
+            try {
+              const sheets = await readUploadedFile(file.path, extension);
+              totals.sheets += sheets.length;
 
-        for (const file of req.files) {
-          const filePath = file.path;
-          const fileExtension = file.originalname
-            .split(".")
-            .pop()
-            .toLowerCase();
+              const { records, skipped, detectedColumns, sheetsWithoutHeader } =
+                extractRecords(sheets, knownColumns);
 
-          let fileData = [];
-          let sheetCount = 0;
-
-          try {
-            if (fileExtension === "csv") {
-              await new Promise((resolve, reject) => {
-                const results = [];
-                fs.createReadStream(filePath)
-                  .pipe(csv())
-                  .on("data", (row) => {
-                    const cleanedRow = cleanObjectForSampleData(row);
-                    if (Object.keys(cleanedRow).length > 0) {
-                      results.push(cleanedRow);
-                    }
-                  })
-                  .on("end", () => {
-                    fileData = results;
-                    sheetCount = 1;
-                    resolve();
-                  })
-                  .on("error", reject);
-              });
-            } else if (fileExtension === "xlsx" || fileExtension === "xls") {
-              const workbook = XLSX.readFile(filePath);
-              const sheetNames = workbook.SheetNames;
-              sheetCount = sheetNames.length;
-
-              for (const sheetName of sheetNames) {
-                const sheet = workbook.Sheets[sheetName];
-                const rawData = XLSX.utils.sheet_to_json(sheet, {
-                  defval: null,
-                });
-                const sheetData = rawData
-                  .map(cleanObjectForSampleData)
-                  .filter((row) => Object.keys(row).length > 0);
-
-                fileData = fileData.concat(sheetData);
-              }
-            } else {
-              throw new Error("Invalid file format");
-            }
-
-            if (fileData.length === 0) {
-              console.warn("No data processed from file:", filePath);
-              continue;
-            }
-
-            for (let i = 0; i < fileData.length; i += BATCH_SIZE) {
-              const batch = fileData.slice(i, i + BATCH_SIZE);
-
-              const keys = batch
-                .filter((record) => record.StoreName && record.Date)
-                .map((record) => ({
-                  StoreName: record.StoreName,
-                  Date: record.Date,
-                }));
-
-              if (keys.length === 0) continue;
-
-              const existingRecords = await brandsDb
-                .collection(brand)
-                .find({ $or: keys })
-                .project({ StoreName: 1, Date: 1 })
-                .toArray();
-
-              const existingKeys = new Set(
-                existingRecords.map((r) => `${r.StoreName}|${r.Date}`),
+              totals.skippedMissingStoreName += skipped.missingStoreName;
+              totals.skippedMissingOrInvalidDate += skipped.missingOrInvalidDate;
+              totals.skippedSamples.push(
+                ...skipped.samples.map((s) => ({ file: file.originalname, ...s })),
               );
-
-              const recordsToInsert = batch.filter((record) => {
-                if (!record.StoreName || !record.Date) return false;
-                const key = `${record.StoreName}|${record.Date}`;
-                return !existingKeys.has(key);
-              });
-
-              if (recordsToInsert.length > 0) {
-                const result = await brandsDb
-                  .collection(brand)
-                  .insertMany(recordsToInsert, { ordered: false });
-                totalInserted += result.insertedCount;
+              if (totals.detectedColumns.length === 0) {
+                totals.detectedColumns = detectedColumns.slice(0, 40);
+              }
+              if (sheetsWithoutHeader.length > 0) {
+                totals.errors.push(
+                  `${file.originalname}: no header row containing a store column (StoreName/Store/Location) and a Date column was found in sheet(s): ${sheetsWithoutHeader.join(", ")}`,
+                );
               }
 
-              totalDuplicates += batch.length - recordsToInsert.length;
-              await new Promise((resolve) => setTimeout(resolve, 5));
-            }
+              if (records.length === 0) continue;
 
-            totalSheets += sheetCount;
-          } catch (err) {
-            console.error(`Error processing file ${file.originalname}:`, err);
-          } finally {
-            await fs.promises
-              .unlink(filePath)
-              .catch((err) =>
-                console.error(`Failed to delete file ${filePath}:`, err),
+              const stored = await storeRecords(collection, records);
+              totals.inserted += stored.inserted;
+              totals.duplicates += stored.duplicates;
+              totals.updated += stored.updated;
+              stored.errors.forEach((e) =>
+                totals.errors.push(`${file.originalname}: ${e}`),
               );
+            } catch (err) {
+              console.error(`Error processing file ${file.originalname}:`, err);
+              totals.errors.push(`${file.originalname}: ${err.message}`);
+            } finally {
+              await fs.promises
+                .unlink(file.path)
+                .catch((err) =>
+                  console.error(`Failed to delete file ${file.path}:`, err),
+                );
+            }
           }
-        }
+          return totals;
+        });
 
-        const response = {
-          message:
-            totalInserted > 0
-              ? "Data uploaded successfully"
-              : totalDuplicates > 0
-                ? "No new data uploaded; all records were duplicates"
-                : "No valid data to insert",
-          insertedCount: totalInserted,
-          duplicateCount: totalDuplicates,
-          sheetCount: totalSheets,
+        const skippedCount =
+          summary.skippedMissingStoreName + summary.skippedMissingOrInvalidDate;
+        const nothingStored =
+          summary.inserted === 0 && summary.updated === 0 && summary.duplicates === 0;
+
+        let message;
+        if (summary.inserted > 0) message = "Data uploaded successfully";
+        else if (summary.duplicates > 0 || summary.updated > 0)
+          message = "No new rows; all records were already stored";
+        else if (skippedCount > 0)
+          message = `No records were stored: ${skippedCount} row(s) had no usable ${
+            summary.skippedMissingStoreName > 0 ? "StoreName" : "Date"
+          }${
+            summary.skippedMissingStoreName > 0 &&
+            summary.skippedMissingOrInvalidDate > 0
+              ? " / Date"
+              : ""
+          }. Columns found: ${summary.detectedColumns.join(", ") || "none"}`;
+        else if (summary.errors.length > 0)
+          message = `Upload failed: ${summary.errors[0]}`;
+        else message = "The file contained no data rows";
+
+        const body = {
+          success: !nothingStored,
+          message,
+          insertedCount: summary.inserted,
+          duplicateCount: summary.duplicates,
+          updatedCount: summary.updated,
+          skippedCount,
+          skipped: {
+            missingStoreName: summary.skippedMissingStoreName,
+            missingOrInvalidDate: summary.skippedMissingOrInvalidDate,
+            samples: summary.skippedSamples.slice(0, 5),
+          },
+          detectedColumns: summary.detectedColumns,
+          errors: summary.errors,
+          sheetCount: summary.sheets,
           fileCount: req.files.length,
         };
 
-        res.send(response);
+        // Nothing stored and nothing recognised as already stored means the
+        // upload did not work - say so instead of reporting success.
+        res.status(nothingStored ? 422 : 200).send(body);
       } catch (err) {
         console.error("Upload error:", err);
         res
