@@ -96,6 +96,27 @@ const DATE_ALIASES = [
   "transactiondate",
 ];
 
+// Columns that hold a store *identifier* (number or code) rather than a name.
+const STORE_ID_ALIASES = [
+  "storenumber",
+  "storeno",
+  "storenum",
+  "storeid",
+  "storecode",
+  "locationnumber",
+  "locationno",
+  "locationid",
+  "unitnumber",
+  "unitno",
+  "unitid",
+  "restaurantnumber",
+  "restaurantno",
+  "restaurantid",
+  "sitenumber",
+  "siteid",
+];
+const STORE_ID_SET = new Set(STORE_ID_ALIASES);
+
 const HEADER_SCAN_ROWS = 30;
 
 function findAliasIndex(normalizedHeaders, aliases) {
@@ -106,40 +127,76 @@ function findAliasIndex(normalizedHeaders, aliases) {
   return -1;
 }
 
+// "02384", "#2384", " 2384.0 " and 2384 are the same store id; text ids such as
+// "Burger Exp 1" are compared ignoring case and spacing.
+export function normId(value) {
+  let s = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^#\s*/, "")
+    .replace(/\s+/g, " ");
+  if (/^\d+(\.0+)?$/.test(s)) s = s.replace(/\.0+$/, "").replace(/^0+(?=\d)/, "");
+  return s;
+}
+
 // Reports often have title rows above the real header, so look for the first
-// row that contains both a store column and a date column.
+// row that has a date column and some way of identifying the store.
 export function detectHeaderRow(rows) {
   const limit = Math.min(rows.length, HEADER_SCAN_ROWS);
   for (let r = 0; r < limit; r++) {
     const normalized = (rows[r] || []).map(normKey);
-    if (
-      findAliasIndex(normalized, STORE_ALIASES) !== -1 &&
-      findAliasIndex(normalized, DATE_ALIASES) !== -1
-    ) {
-      return r;
-    }
+    const hasStore =
+      findAliasIndex(normalized, STORE_ALIASES) !== -1 ||
+      findAliasIndex(normalized, STORE_ID_ALIASES) !== -1;
+    if (hasStore && findAliasIndex(normalized, DATE_ALIASES) !== -1) return r;
   }
   return -1;
 }
 
+// Decides which header is the store name, which is the store id and which is
+// the date. A weakly-named column ("Store", "Location") whose values are mostly
+// ids we know is treated as an id column, not a name.
+export function locateColumns(headerCells, dataRows = [], idToName = new Map()) {
+  const normalized = headerCells.map(normKey);
+  const dateIdx = findAliasIndex(normalized, DATE_ALIASES);
+  const exactNameIdx = normalized.indexOf("storename");
+  let nameIdx = exactNameIdx !== -1 ? exactNameIdx : findAliasIndex(normalized, STORE_ALIASES);
+  let idIdx = findAliasIndex(normalized, STORE_ID_ALIASES);
+
+  if (exactNameIdx === -1 && nameIdx !== -1 && idToName.size > 0) {
+    const sample = [];
+    for (const row of dataRows) {
+      const v = row?.[nameIdx];
+      if (v !== null && v !== undefined && String(v).trim() !== "") sample.push(v);
+      if (sample.length >= 50) break;
+    }
+    const known = sample.filter((v) => idToName.has(normId(v))).length;
+    if (sample.length > 0 && known / sample.length >= 0.5 && idIdx === -1) {
+      idIdx = nameIdx;
+      nameIdx = -1;
+    }
+  }
+  return { nameIdx, idIdx, dateIdx };
+}
+
 // Maps every header cell to the column name it should be stored under:
-//  - the store / date columns become exactly "StoreName" / "Date"
+//  - the store name / date columns become exactly "StoreName" / "Date"
 //  - headers that match a column the collection already has (ignoring case,
 //    spaces and punctuation) reuse that column's name, so the same data never
 //    ends up split across "NetSales", "Net Sales" and "NETSALES"
-//  - anything else keeps its own name (new columns are never dropped)
-export function buildColumnTargets(headerCells, knownColumns = new Map()) {
+//  - anything else keeps its own name (new columns are never dropped), and a
+//    store-id column is kept as a normal column next to the resolved StoreName
+export function buildColumnTargets(headerCells, knownColumns = new Map(), roles = null) {
   const headers = headerCells.map((h) =>
     h === null || h === undefined ? "" : String(h).trim(),
   );
   const normalized = headers.map(normKey);
-  const storeIdx = findAliasIndex(normalized, STORE_ALIASES);
-  const dateIdx = findAliasIndex(normalized, DATE_ALIASES);
+  const { nameIdx, dateIdx } = roles ?? locateColumns(headerCells);
 
   const used = new Set();
   return headers.map((header, i) => {
     let target;
-    if (i === storeIdx) target = "StoreName";
+    if (i === nameIdx) target = "StoreName";
     else if (i === dateIdx) target = "Date";
     else if (!header) target = i === 0 ? "__EMPTY" : `__EMPTY_${i}`;
     else {
@@ -192,11 +249,12 @@ export async function readUploadedFile(filePath, extension) {
 
 // Turns the raw rows of every sheet into cleaned records and reports exactly
 // why any row was left out (instead of silently dropping it).
-export function extractRecords(sheets, knownColumns = new Map()) {
+export function extractRecords(sheets, knownColumns = new Map(), idToName = new Map()) {
   const records = [];
   const skipped = { missingStoreName: 0, missingOrInvalidDate: 0, samples: [] };
   const detectedColumns = [];
   const sheetsWithoutHeader = [];
+  const storeIds = { column: null, resolved: 0, unresolved: new Set() };
 
   for (const { sheetName, rows } of sheets) {
     if (!rows || rows.length === 0) continue;
@@ -208,8 +266,12 @@ export function extractRecords(sheets, knownColumns = new Map()) {
       if (headerRow === -1) continue;
     }
 
-    const targets = buildColumnTargets(rows[headerRow], knownColumns);
+    const roles = locateColumns(rows[headerRow], rows.slice(headerRow + 1), idToName);
+    const targets = buildColumnTargets(rows[headerRow], knownColumns, roles);
     if (detectedColumns.length === 0) detectedColumns.push(...targets);
+    // No store name column: the name is looked up from the store id column.
+    const idTarget = roles.nameIdx === -1 && roles.idIdx !== -1 ? targets[roles.idIdx] : null;
+    if (idTarget && !storeIds.column) storeIds.column = idTarget;
 
     // cleanObjectForSampleData strips spaces from keys, which would split
     // "Transaction Count" (already stored) from "TransactionCount". Clean the
@@ -233,15 +295,20 @@ export function extractRecords(sheets, knownColumns = new Map()) {
         raw[key] = row[c] === undefined ? null : row[c];
       }
       const cleaned = cleanObjectForSampleData(raw);
-      const record = {};
+      let record = {};
       for (const [key, value] of Object.entries(cleaned)) {
         record[restore.get(key) ?? key] = value;
       }
 
-      const hasStore =
-        record.StoreName !== null &&
-        record.StoreName !== undefined &&
-        String(record.StoreName).trim() !== "";
+      if (idTarget && !isEmptyValue(record[idTarget])) {
+        const idValue = record[idTarget];
+        const name = idToName.get(normId(idValue));
+        if (name) storeIds.resolved++;
+        else storeIds.unresolved.add(String(idValue).trim());
+        record = { StoreName: name ?? String(idValue).trim(), ...record };
+      }
+
+      const hasStore = !isEmptyValue(record.StoreName) && String(record.StoreName).trim() !== "";
       const hasDate = Boolean(record.Date);
 
       if (hasStore && hasDate) {
@@ -254,13 +321,13 @@ export function extractRecords(sheets, knownColumns = new Map()) {
         skipped.samples.push({
           sheet: sheetName,
           row: r + 1,
-          reason: !hasStore ? "missing StoreName" : "missing or invalid Date",
+          reason: !hasStore ? "missing StoreName / store id" : "missing or invalid Date",
         });
       }
     }
   }
 
-  return { records, skipped, detectedColumns, sheetsWithoutHeader };
+  return { records, skipped, detectedColumns, sheetsWithoutHeader, storeIds };
 }
 
 // ─── Storing without duplicates or data loss ───────────────────────────────────
@@ -269,6 +336,22 @@ export const recordKey = (record) =>
   `${String(record.StoreName).toLowerCase().replace(/\s+/g, " ").trim()}|${record.Date}`;
 
 const isEmptyValue = (v) => v === null || v === undefined || v === "";
+
+// The store id a record carries (if it has a StoreNumber / StoreNo / ... column).
+export function storeIdOf(record) {
+  for (const [key, value] of Object.entries(record)) {
+    if (STORE_ID_SET.has(normKey(key)) && !isEmptyValue(value)) return normId(value);
+  }
+  return null;
+}
+
+// Every key two records can be recognised as the same store+day by.
+const identityKeys = (record) => {
+  const keys = [recordKey(record)];
+  const id = storeIdOf(record);
+  if (id) keys.push(`#${id}|${record.Date}`);
+  return keys;
+};
 
 // Fields the record has that the stored document lacks (never overwrites a
 // value that is already stored).
@@ -294,17 +377,48 @@ export async function loadKnownColumns(collection, sampleSize = 200) {
   return known;
 }
 
+// store id -> store name. What this brand's collection already uses wins (so
+// names stay consistent), then the StoreData collection (NO -> NAME).
+export async function loadStoreIdMap(collection, storeDataCollection, sampleSize = 2000) {
+  const map = new Map();
+  const add = (id, name) => {
+    const key = normId(id);
+    if (key && name && !map.has(key)) map.set(key, String(name));
+  };
+
+  const docs = await collection.find({}).limit(sampleSize).toArray();
+  for (const doc of docs) {
+    if (isEmptyValue(doc.StoreName)) continue;
+    const id = storeIdOf(doc);
+    // Rows stored under their raw id (name unknown at the time) say nothing
+    // about the real name, so they must not shadow StoreData.
+    if (id && normId(doc.StoreName) === id) continue;
+    if (id) add(id, doc.StoreName);
+    for (const group of String(doc.StoreName).match(/\d{3,}/g) || []) add(group, doc.StoreName);
+  }
+
+  if (storeDataCollection) {
+    const stores = await storeDataCollection.find({}).toArray();
+    for (const store of stores) {
+      if (!isEmptyValue(store.NO) && !isEmptyValue(store.NAME)) add(store.NO, store.NAME);
+    }
+  }
+  return map;
+}
+
 export async function storeRecords(collection, records, { dateChunk = 100 } = {}) {
   const result = { inserted: 0, duplicates: 0, updated: 0, errors: [] };
 
   // 1. Collapse duplicates inside the upload itself; a later copy can still
   //    contribute fields the first copy lacked.
-  const unique = new Map();
+  const seen = new Map();
+  const unique = [];
   for (const record of records) {
-    const key = recordKey(record);
-    const first = unique.get(key);
+    const keys = identityKeys(record);
+    const first = keys.map((k) => seen.get(k)).find(Boolean);
     if (!first) {
-      unique.set(key, record);
+      keys.forEach((k) => seen.set(k, record));
+      unique.push(record);
       continue;
     }
     result.duplicates++;
@@ -313,7 +427,7 @@ export async function storeRecords(collection, records, { dateChunk = 100 } = {}
 
   // 2. Compare against what is already stored, a few dates at a time.
   const byDate = new Map();
-  for (const record of unique.values()) {
+  for (const record of unique) {
     if (!byDate.has(record.Date)) byDate.set(record.Date, []);
     byDate.get(record.Date).push(record);
   }
@@ -327,22 +441,35 @@ export async function storeRecords(collection, records, { dateChunk = 100 } = {}
         .toArray();
       const existingByKey = new Map();
       for (const doc of existingDocs) {
-        if (doc.StoreName === undefined || doc.StoreName === null) continue;
-        const key = recordKey(doc);
-        if (!existingByKey.has(key)) existingByKey.set(key, doc);
+        if (isEmptyValue(doc.StoreName)) continue;
+        for (const key of identityKeys(doc)) {
+          if (!existingByKey.has(key)) existingByKey.set(key, doc);
+        }
       }
 
       const toInsert = [];
       const updates = [];
       for (const date of chunkDates) {
         for (const record of byDate.get(date)) {
-          const existing = existingByKey.get(recordKey(record));
+          const existing = identityKeys(record)
+            .map((k) => existingByKey.get(k))
+            .find(Boolean);
           if (!existing) {
             toInsert.push(record);
             continue;
           }
           result.duplicates++;
           const fields = missingFields(existing, record);
+          // A row stored earlier under its raw id (name was unknown then) gets
+          // the proper store name once it can be resolved.
+          const id = storeIdOf(record);
+          if (
+            id &&
+            record.StoreName !== existing.StoreName &&
+            normId(existing.StoreName) === id
+          ) {
+            fields.StoreName = record.StoreName;
+          }
           if (Object.keys(fields).length > 0) {
             updates.push({
               updateOne: { filter: { _id: existing._id }, update: { $set: fields } },

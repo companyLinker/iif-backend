@@ -17,6 +17,7 @@ import {
   readUploadedFile,
   extractRecords,
   loadKnownColumns,
+  loadStoreIdMap,
   storeRecords,
   withBrandLock,
 } from "./uploadProcessing.js";
@@ -756,6 +757,9 @@ connectToMongoDB()
           await collection.createIndex({ StoreName: 1, Date: 1 });
           await collection.createIndex({ Date: 1 });
           const knownColumns = await loadKnownColumns(collection);
+          // store id (StoreNumber, StoreNo, ...) -> store name, from this
+          // brand's existing rows first, then the StoreData collection
+          const idToName = await loadStoreIdMap(collection, db.collection("StoreData"));
 
           const totals = {
             inserted: 0,
@@ -766,6 +770,9 @@ connectToMongoDB()
             skippedMissingOrInvalidDate: 0,
             skippedSamples: [],
             detectedColumns: [],
+            storeIdColumn: null,
+            storeNamesResolved: 0,
+            unresolvedStoreIds: new Set(),
             errors: [],
           };
 
@@ -775,8 +782,12 @@ connectToMongoDB()
               const sheets = await readUploadedFile(file.path, extension);
               totals.sheets += sheets.length;
 
-              const { records, skipped, detectedColumns, sheetsWithoutHeader } =
-                extractRecords(sheets, knownColumns);
+              const { records, skipped, detectedColumns, sheetsWithoutHeader, storeIds } =
+                extractRecords(sheets, knownColumns, idToName);
+
+              totals.storeIdColumn = totals.storeIdColumn || storeIds.column;
+              totals.storeNamesResolved += storeIds.resolved;
+              storeIds.unresolved.forEach((id) => totals.unresolvedStoreIds.add(id));
 
               totals.skippedMissingStoreName += skipped.missingStoreName;
               totals.skippedMissingOrInvalidDate += skipped.missingOrInvalidDate;
@@ -788,7 +799,7 @@ connectToMongoDB()
               }
               if (sheetsWithoutHeader.length > 0) {
                 totals.errors.push(
-                  `${file.originalname}: no header row containing a store column (StoreName/Store/Location) and a Date column was found in sheet(s): ${sheetsWithoutHeader.join(", ")}`,
+                  `${file.originalname}: no header row containing a store column (StoreName, Store, Location, StoreNumber, StoreNo, ...) and a Date column was found in sheet(s): ${sheetsWithoutHeader.join(", ")}`,
                 );
               }
 
@@ -850,6 +861,9 @@ connectToMongoDB()
             samples: summary.skippedSamples.slice(0, 5),
           },
           detectedColumns: summary.detectedColumns,
+          storeIdColumn: summary.storeIdColumn,
+          storeNamesResolved: summary.storeNamesResolved,
+          unresolvedStoreIds: [...summary.unresolvedStoreIds].slice(0, 25),
           errors: summary.errors,
           sheetCount: summary.sheets,
           fileCount: req.files.length,

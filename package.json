@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/uploadProcessing.test.js"
+    "test": "node --test test/uploadProcessing.test.js test/storeId.test.js"
   },
   "keywords": [],
   "author": "",
