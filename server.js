@@ -12,6 +12,9 @@ import archiver from "archiver";
 import axios from "axios";
 import path from "path";
 import { fileURLToPath } from "url";
+import zlib from "zlib";
+import { promisify } from "util";
+import compression from "compression";
 import {
   cleanObjectForSampleData,
   readUploadedFile,
@@ -27,6 +30,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
 const app = express();
+const gunzipAsync = promisify(zlib.gunzip);
 
 // A bug in any single request handler (e.g. writing to a client that has
 // already disconnected) can otherwise throw an unhandled rejection, which
@@ -53,6 +57,7 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use(compression({ threshold: 1024 }));
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 const port = process.env.PORT || 3001;
@@ -81,6 +86,22 @@ const upload = multer({
   },
 });
 
+// Cheque sheet files: .csv/.txt, or the same gzipped by the browser (large
+// files are compressed before upload so they fit through the proxy).
+const chequeUpload = multer({
+  dest: "./Uploads/",
+  limits: { fileSize: 300 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = file.originalname.split(".").pop().toLowerCase();
+    if (["csv", "txt", "gz"].includes(ext)) cb(null, true);
+    else {
+      const error = new Error("Only CSV or TXT files are allowed");
+      error.status = 400;
+      cb(error);
+    }
+  },
+});
+
 let db;
 let brandsDb;
 let transactionsRef;
@@ -98,46 +119,94 @@ const logToGoogleSheet = async (logData) => {
   }
 };
 
+let connecting = null;
+let dbIsReady = false;
+
 async function connectToMongoDB() {
-  try {
-    if (
-      mongoClient &&
-      mongoClient.topology &&
-      mongoClient.topology.isConnected()
-    ) {
-      if (!db) db = mongoClient.db(dbName);
-      if (!brandsDb) brandsDb = mongoClient.db(brandsDbName);
-      if (!transactionsRef) transactionsRef = mongoClient.db("Transactions");
-      return mongoClient;
+  if (mongoClient && db && brandsDb) return mongoClient;
+  if (connecting) return connecting;
+
+  connecting = (async () => {
+    try {
+      const client = await MongoClient.connect(mongoUrl, {
+        connectTimeoutMS: 30000,
+        serverSelectionTimeoutMS: 15000,
+        // long reads/aggregations used to be cut off after 30s
+        socketTimeoutMS: 300000,
+        maxPoolSize: 50,
+      });
+      mongoClient = client;
+      db = client.db(dbName);
+      brandsDb = client.db(brandsDbName);
+      transactionsRef = client.db("Transactions");
+      return client;
+    } catch (err) {
+      console.error("Error connecting to MongoDB:", {
+        message: err.message,
+        stack: err.stack,
+      });
+      mongoClient = null;
+      throw err;
+    } finally {
+      connecting = null;
     }
+  })();
+  return connecting;
+}
 
-    mongoClient = await MongoClient.connect(mongoUrl, {
-      connectTimeoutMS: 30000,
-      socketTimeoutMS: 30000,
-      maxPoolSize: 50,
-    });
-
-    db = mongoClient.db(dbName);
-    brandsDb = mongoClient.db(brandsDbName);
-    transactionsRef = mongoClient.db("Transactions");
-
-    await db.collection("SampleData").createIndex({ Date: 1 });
-    await db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 });
-    await db.collection("BMData").createIndex({ Name: 1 });
-    await db.collection("Formats").createIndex({ name: 1 }, { unique: true });
-    await db
-      .collection("Formulas")
-      .createIndex({ formula: 1, column: 1, brand: 1 }, { unique: true });
-
-    return mongoClient;
-  } catch (err) {
-    console.error("Error connecting to MongoDB:", {
-      message: err.message,
-      stack: err.stack,
-    });
-    mongoClient = null;
-    throw err;
+// Index creation is an optimisation, never a reason to refuse requests (a
+// failing unique index used to make the whole server exit on start-up).
+async function ensureIndexes() {
+  const jobs = [
+    () => db.collection("SampleData").createIndex({ Date: 1 }),
+    () => db.collection("SampleData").createIndex({ StoreName: 1, Date: 1 }),
+    () => db.collection("BMData").createIndex({ Name: 1 }),
+    () => db.collection("Formats").createIndex({ name: 1 }, { unique: true }),
+    () =>
+      db
+        .collection("Formulas")
+        .createIndex({ formula: 1, column: 1, brand: 1 }, { unique: true }),
+  ];
+  for (const job of jobs) {
+    try {
+      await job();
+    } catch (err) {
+      console.error("Index creation skipped:", err.message);
+    }
   }
+}
+
+// Resolves true once MongoDB is connected. It retries forever instead of
+// exiting, so a database blip no longer takes the whole API down.
+const dbReady = (async () => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await connectToMongoDB();
+      dbIsReady = true;
+      ensureIndexes();
+      initializeTransactionLog();
+      return true;
+    } catch {
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(30000, 1000 * attempt)),
+      );
+    }
+  }
+})();
+
+// Requests that arrive while the database is still connecting wait for it
+// (up to 20s) instead of failing; after that they get a retryable 503.
+async function waitForDb(req, res, next) {
+  if (dbIsReady) return next();
+  const ready = await Promise.race([
+    dbReady,
+    new Promise((resolve) => setTimeout(() => resolve(false), 20000)),
+  ]);
+  if (ready === true) return next();
+  res.set("Retry-After", "3");
+  res
+    .status(503)
+    .send({ message: "Database is starting, please retry in a moment" });
 }
 
 async function initializeTransactionLog() {
@@ -186,10 +255,12 @@ function cleanObjectForBMData(obj) {
   return cleaned;
 }
 
-connectToMongoDB()
-  .then((client) => {
-    mongoClient = client;
-    initializeTransactionLog();
+app.get("/api/health", (req, res) => {
+  res.send({ status: "ok", db: dbIsReady, uptime: Math.round(process.uptime()) });
+});
+app.use(waitForDb);
+
+{
 
     app.get("/api/brands", async (req, res) => {
       try {
@@ -503,7 +574,7 @@ connectToMongoDB()
 
     app.post(
       "/api/generate-cheque-sheet",
-      upload.single("file"),
+      chequeUpload.single("file"),
       async (req, res) => {
         try {
           if (!req.file) {
@@ -516,6 +587,12 @@ connectToMongoDB()
             .collection("BMData")
             .find({
               Cashpro: { $regex: /^yes$/i },
+            })
+            .project({
+              BankAccountNo1: 1,
+              BankAccountNo2: 1,
+              BankAccountNo3: 1,
+              BankAccountNo4: 1,
             })
             .toArray();
 
@@ -543,7 +620,12 @@ connectToMongoDB()
               validAccounts.add(cleanBankAccount(doc.BankAccountNo4));
           });
 
-          const fileContent = fs.readFileSync(req.file.path, "utf8");
+          const rawBuffer = await fs.promises.readFile(req.file.path);
+          const isGzip =
+            rawBuffer.length > 2 && rawBuffer[0] === 0x1f && rawBuffer[1] === 0x8b;
+          const fileContent = (isGzip ? await gunzipAsync(rawBuffer) : rawBuffer)
+            .toString("utf8")
+            .replace(/^\uFEFF/, "");
           const lines = fileContent.split(/\r?\n/);
 
           const outputRows = [];
@@ -606,7 +688,7 @@ connectToMongoDB()
 
           await fs.promises.unlink(req.file.path).catch(console.error);
 
-          const archive = archiver("zip", { zlib: { level: 9 } });
+          const archive = archiver("zip", { zlib: { level: 6 } });
 
           res.setHeader("Content-Type", "application/zip");
           res.setHeader(
@@ -621,6 +703,8 @@ connectToMongoDB()
           await archive.finalize();
         } catch (err) {
           console.error("Error generating cheque sheets:", err);
+          if (req.file) await fs.promises.unlink(req.file.path).catch(() => {});
+          if (res.headersSent) return res.destroy(err);
           res
             .status(500)
             .send({ message: "Error generating sheets", error: err.message });
@@ -1891,11 +1975,24 @@ connectToMongoDB()
       }
     });
 
-    app.listen(port, () => {});
-  })
-  .catch((err) => {
-    process.exit(1);
-  });
+    // JSON errors (with CORS headers) instead of HTML pages the browser reports as CORS failures
+    app.use((err, req, res, next) => {
+      if (res.headersSent) return next(err);
+      console.error("Request error:", err.message);
+      const status =
+        err.status ||
+        err.statusCode ||
+        (err.code === "LIMIT_FILE_SIZE" ? 413 : 500);
+      res.status(status).send({ message: err.message || "Server error" });
+    });
+
+    const server = app.listen(port, () => {});
+    // Longer than nginx's upstream keep-alive, otherwise nginx reuses a
+    // connection Node just closed and returns a random 502.
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 66000;
+    server.requestTimeout = 0;
+}
 
 process.on("SIGINT", async () => {
   if (mongoClient) await mongoClient.close();
