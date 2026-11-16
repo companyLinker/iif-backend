@@ -111,7 +111,7 @@ test("money columns are not mistaken for the date column", () => {
   );
   assert.equal(records.length, 3);
   assert.equal(records[0].Date, "09-01-2026");
-  assert.equal(records[0].NetSales, 45123.55);
+  assert.equal(records[0]["Net Sales"], 45123.55);
 });
 
 test("header row is found below title rows even with an unrecognisable date header", () => {
@@ -173,6 +173,37 @@ test("headers starting with store/location are used even with extra words", () =
     ]),
   );
   assert.equal(records[0].StoreName, "PLK 1");
+});
+
+test("with a date but no recognisable store, the most store-like text column is used and flagged", () => {
+  const sheetRows = [["Posting Day", "Outlet", "Region", "Net Receipts"]];
+  for (let i = 0; i < 40; i++) sheetRows.push([`09/${String((i % 28) + 1).padStart(2, "0")}/2026`, `Place ${i}`, i % 2 ? "East" : "West", i * 2]);
+  const out = extractRecords(sheet(sheetRows));
+  assert.equal(out.records.length, 40);
+  assert.equal(out.records[0].StoreName, "Place 0"); // 40 distinct places beat 2 regions
+  assert.equal(out.storeIds.guessedColumn, "Outlet");
+  assert.equal(out.skipped.missingStoreName, 0);
+});
+
+test("a numeric measure is never mistaken for the store, even when small numbers are 'known ids'", () => {
+  // what loadStoreIdMap builds from rows already stored: store names, plus ids
+  const known = new Map();
+  for (let i = 0; i < 500; i++) known.set(String(i), `#${String(i).padStart(5, "0")} - Place ${i}`);
+  for (let i = 0; i < 500; i++) known.set(`#${i}`, `#${String(i).padStart(5, "0")} - Place ${i}`);
+  const rows = [["Outlet", "Posting Day", "Net Receipts", "Voids", "Tips"]];
+  for (let i = 0; i < 300; i++) rows.push([`#${String(i % 500).padStart(5, "0")} - Place ${i % 500}`, "1/5/2026", i * 1.25, i % 9, i % 5]);
+  const out = extractRecords(sheet(rows), new Map(), known);
+  assert.equal(out.records[7].StoreName, "#00007 - Place 7"); // from Outlet, not from Voids
+  assert.equal(out.storeIds.resolved, 0); // no id lookup happened
+  assert.equal(out.records[7].Voids, 7 % 9);
+});
+
+test("no guess is made without a date, or when no column looks like a store", () => {
+  const noDate = extractRecords(sheet([["Alpha", "Beta"], ["x", "y"], ["z", "w"]]));
+  assert.equal(noDate.storeIds.guessedColumn, null);
+  const numbersOnly = extractRecords(sheet([["Posting Day", "A", "B"], ["09/01/2026", 1, 2], ["09/02/2026", 3, 4], ["09/03/2026", 5, 6]]));
+  assert.equal(numbersOnly.records.length, 0);
+  assert.equal(numbersOnly.storeIds.guessedColumn, null);
 });
 
 test("nothing recognisable is still reported clearly, never silently dropped", () => {

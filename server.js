@@ -17,13 +17,14 @@ import { promisify } from "util";
 import compression from "compression";
 import {
   cleanObjectForSampleData,
-  readUploadedFile,
-  extractRecords,
   loadKnownColumns,
   loadStoreIdMap,
+  readUploadedFile,
   storeRecords,
   withBrandLock,
 } from "./uploadProcessing.js";
+import { processUploadedFile } from "./uploadPipeline.js";
+import { learnProfile, loadBundledProfiles } from "./reportConverter.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -101,6 +102,32 @@ const chequeUpload = multer({
     }
   },
 });
+
+// Sample files for learning an upload profile (a report and the wanted output).
+const profileUpload = multer({
+  dest: "./Uploads/",
+  limits: { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ext = file.originalname.split(".").pop().toLowerCase();
+    if (["csv", "xlsx", "xls"].includes(ext)) cb(null, true);
+    else {
+      const error = new Error("Only CSV, XLSX or XLS files are allowed");
+      error.status = 400;
+      cb(error);
+    }
+  },
+});
+
+// Profiles saved in the database plus the ones shipped in backend/profiles.
+async function loadUploadProfiles(database) {
+  let stored = [];
+  try {
+    stored = await database.collection("UploadProfiles").find({}).toArray();
+  } catch (err) {
+    console.error("Could not read UploadProfiles:", err.message);
+  }
+  return [...stored, ...loadBundledProfiles()];
+}
 
 let db;
 let brandsDb;
@@ -840,10 +867,12 @@ app.use(waitForDb);
         const summary = await withBrandLock(brand, async () => {
           await collection.createIndex({ StoreName: 1, Date: 1 });
           await collection.createIndex({ Date: 1 });
-          const knownColumns = await loadKnownColumns(collection);
-          // store id (StoreNumber, StoreNo, ...) -> store name, from this
-          // brand's existing rows first, then the StoreData collection
-          const idToName = await loadStoreIdMap(collection, db.collection("StoreData"));
+          const [knownColumns, idToName, profiles] = await Promise.all([
+            loadKnownColumns(collection),
+            loadStoreIdMap(collection, db.collection("StoreData")),
+            loadUploadProfiles(db),
+          ]);
+          const context = { brand, knownColumns, idToName, profiles };
 
           const totals = {
             inserted: 0,
@@ -855,47 +884,52 @@ app.use(waitForDb);
             skippedSamples: [],
             detectedColumns: [],
             storeIdColumn: null,
+            storeColumnGuess: null,
             storeNamesResolved: 0,
             unresolvedStoreIds: new Set(),
+            converted: [],
             errors: [],
           };
 
           for (const file of req.files) {
             const extension = file.originalname.split(".").pop().toLowerCase();
             try {
-              const sheets = await readUploadedFile(file.path, extension);
-              totals.sheets += sheets.length;
+              // rows are stored in batches as they are read, so memory stays
+              // flat however large the file is
+              const result = await processUploadedFile(
+                { path: file.path, extension, name: file.originalname },
+                context,
+                async (records) => {
+                  const stored = await storeRecords(collection, records);
+                  totals.inserted += stored.inserted;
+                  totals.duplicates += stored.duplicates;
+                  totals.updated += stored.updated;
+                  stored.errors.forEach((e) =>
+                    totals.errors.push(`${file.originalname}: ${e}`),
+                  );
+                },
+              );
 
-              const { records, skipped, detectedColumns, sheetsWithoutHeader, storeIds } =
-                extractRecords(sheets, knownColumns, idToName);
-
-              totals.storeIdColumn = totals.storeIdColumn || storeIds.column;
-              totals.storeNamesResolved += storeIds.resolved;
-              storeIds.unresolved.forEach((id) => totals.unresolvedStoreIds.add(id));
-
-              totals.skippedMissingStoreName += skipped.missingStoreName;
-              totals.skippedMissingOrInvalidDate += skipped.missingOrInvalidDate;
+              totals.sheets += result.sheets;
+              totals.skippedMissingStoreName += result.skipped.missingStoreName;
+              totals.skippedMissingOrInvalidDate += result.skipped.missingOrInvalidDate;
               totals.skippedSamples.push(
-                ...skipped.samples.map((s) => ({ file: file.originalname, ...s })),
+                ...result.skipped.samples.map((s) => ({ file: file.originalname, ...s })),
               );
               if (totals.detectedColumns.length === 0) {
-                totals.detectedColumns = detectedColumns.slice(0, 40);
+                totals.detectedColumns = result.detectedColumns.slice(0, 40);
               }
-              if (sheetsWithoutHeader.length > 0) {
+              totals.storeIdColumn = totals.storeIdColumn || result.storeIds.column;
+              totals.storeColumnGuess = totals.storeColumnGuess || result.storeIds.guessedColumn;
+              totals.storeNamesResolved += result.storeIds.resolved;
+              result.storeIds.unresolved.forEach((id) => totals.unresolvedStoreIds.add(id));
+              totals.converted.push(...result.converted);
+              result.errors.forEach((e) => totals.errors.push(e));
+              if (result.sheetsWithoutHeader.length > 0) {
                 totals.errors.push(
-                  `${file.originalname}: no header row containing a store column (StoreName, Store, Location, StoreNumber, StoreNo, ...) and a Date column was found in sheet(s): ${sheetsWithoutHeader.join(", ")}`,
+                  `${file.originalname}: no header row containing a store column (StoreName, Store, Location, StoreNumber, StoreNo, ...) and a date column was found in sheet(s): ${result.sheetsWithoutHeader.join(", ")}`,
                 );
               }
-
-              if (records.length === 0) continue;
-
-              const stored = await storeRecords(collection, records);
-              totals.inserted += stored.inserted;
-              totals.duplicates += stored.duplicates;
-              totals.updated += stored.updated;
-              stored.errors.forEach((e) =>
-                totals.errors.push(`${file.originalname}: ${e}`),
-              );
             } catch (err) {
               console.error(`Error processing file ${file.originalname}:`, err);
               totals.errors.push(`${file.originalname}: ${err.message}`);
@@ -946,8 +980,10 @@ app.use(waitForDb);
           },
           detectedColumns: summary.detectedColumns,
           storeIdColumn: summary.storeIdColumn,
+          storeColumnGuess: summary.storeColumnGuess,
           storeNamesResolved: summary.storeNamesResolved,
           unresolvedStoreIds: [...summary.unresolvedStoreIds].slice(0, 25),
+          converted: summary.converted,
           errors: summary.errors,
           sheetCount: summary.sheets,
           fileCount: req.files.length,
@@ -961,6 +997,101 @@ app.use(waitForDb);
         res
           .status(500)
           .send({ message: "Error uploading files", error: err.message });
+      }
+    });
+
+    // ── Upload profiles: how a report layout is turned into the stored format ──
+    app.get("/api/upload-profiles", async (req, res) => {
+      try {
+        const stored = (await db.collection("UploadProfiles").find({}).toArray()).map((p) => ({
+          ...p,
+          _id: p._id.toString(),
+          origin: "database",
+        }));
+        const bundled = loadBundledProfiles().map((p) => ({ ...p, origin: "bundled" }));
+        const brand = req.query.brand;
+        res.send(
+          [...stored, ...bundled]
+            .filter((p) => !brand || (p.brands || []).some((b) => b === "*" || b === brand))
+            .map((p) => ({
+              id: p._id ?? null,
+              name: p.name,
+              brands: p.brands,
+              origin: p.origin,
+              layout: p.layout,
+              columns: (p.columns || []).map((c) => c.name),
+              learnedFrom: p.learnedFrom ?? null,
+            })),
+        );
+      } catch (err) {
+        res.status(500).send({ message: "Error fetching upload profiles", error: err.message });
+      }
+    });
+
+    // Upload one or more sample reports ("sources") and a sample of the wanted
+    // output ("target"); the mapping between them is worked out and, with
+    // save=true, stored for that brand.
+    app.post(
+      "/api/upload-profiles/learn",
+      profileUpload.fields([
+        { name: "sources", maxCount: 12 },
+        { name: "target", maxCount: 1 },
+      ]),
+      async (req, res) => {
+        const files = [...(req.files?.sources || []), ...(req.files?.target || [])];
+        try {
+          const { brand, name } = req.body;
+          const sourceFiles = req.files?.sources || [];
+          const targetFile = req.files?.target?.[0];
+          if (!brand || !targetFile || sourceFiles.length === 0) {
+            return res.status(400).send({
+              message: "A brand, at least one sample report (sources) and a sample of the wanted output (target) are required",
+            });
+          }
+
+          const firstSheetRows = async (f) => {
+            const ext = f.originalname.split(".").pop().toLowerCase();
+            return (await readUploadedFile(f.path, ext))[0].rows;
+          };
+          const sources = [];
+          for (const f of sourceFiles) sources.push({ rows: await firstSheetRows(f) });
+
+          const idToName = await loadStoreIdMap(
+            brandsDb.collection(brand),
+            db.collection("StoreData"),
+          );
+          const { profile, report } = learnProfile({
+            sources,
+            targetRows: await firstSheetRows(targetFile),
+            brand,
+            name: name || `${brand} report`,
+            idToName,
+          });
+
+          let saved = false;
+          if (String(req.body.save) === "true") {
+            await db
+              .collection("UploadProfiles")
+              .replaceOne({ name: profile.name, brands: brand }, profile, { upsert: true });
+            saved = true;
+          }
+          res.send({ saved, profile, report });
+        } catch (err) {
+          res.status(400).send({ message: err.message });
+        } finally {
+          await Promise.all(files.map((f) => fs.promises.unlink(f.path).catch(() => {})));
+        }
+      },
+    );
+
+    app.delete("/api/upload-profiles/:id", async (req, res) => {
+      try {
+        const result = await db
+          .collection("UploadProfiles")
+          .deleteOne({ _id: new ObjectId(req.params.id) });
+        res.send({ deletedCount: result.deletedCount });
+      } catch (err) {
+        res.status(400).send({ message: "Could not delete profile", error: err.message });
       }
     });
 
@@ -1178,7 +1309,7 @@ app.use(waitForDb);
         const result = await brandsDb
           .collection(brand)
           .updateOne({ _id: objectId }, [
-            { $set: cleanObjectForSampleData(updates) },
+            { $set: cleanObjectForSampleData(updates, { keepKeys: true }) },
           ]);
 
         if (result.matchedCount === 0)
@@ -1226,7 +1357,7 @@ app.use(waitForDb);
         const bulkOperations = await Promise.all(
           updates.map(async ({ id, updates: newUpdates }) => {
             let objectId = new ObjectId(id);
-            const cleanedUpdates = cleanObjectForSampleData(newUpdates);
+            const cleanedUpdates = cleanObjectForSampleData(newUpdates, { keepKeys: true });
             const originalRecord = await brandsDb
               .collection(brand)
               .findOne({ _id: objectId });

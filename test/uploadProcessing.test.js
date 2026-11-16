@@ -17,9 +17,11 @@ function fakeCollection(initial = []) {
   let nextId = 0;
   const matches = (doc, filter) =>
     Object.entries(filter).every(([k, cond]) =>
-      cond && typeof cond === "object" && "$in" in cond
-        ? cond.$in.includes(doc[k])
-        : doc[k] === cond,
+      k === "$or"
+        ? cond.some((f) => matches(doc, f))
+        : cond && typeof cond === "object" && "$in" in cond
+          ? cond.$in.includes(doc[k])
+          : doc[k] === cond,
     );
   return {
     docs,
@@ -135,7 +137,7 @@ test("headers matching an existing column reuse its name (no split columns)", as
     known,
   );
   assert.deepEqual(Object.keys(records[0]).sort(), [
-    "BrandNew",
+    "Brand New",
     "Date",
     "NetSalesICR",
     "Non-TaxableSal",
@@ -160,7 +162,7 @@ test("existing column names containing spaces are preserved exactly", async () =
     "Cash Shortage",
     "Date",
     "StoreName",
-    "TipReceived",
+    "Tip Received",
     "Transaction Count",
   ]);
   assert.equal(records[0]["Transaction Count"], 9);

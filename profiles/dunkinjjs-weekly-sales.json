@@ -1,0 +1,212 @@
+{
+  "name": "Weekly sales report to daily sales summary",
+  "brands": [
+    "DunkinJJS"
+  ],
+  "layout": "metrics-by-date",
+  "version": 1,
+  "detect": {
+    "title": "weeklysalesreportv2",
+    "labels": [
+      "inoriginals",
+      "infavorites",
+      "inbeverage",
+      "insides",
+      "incombos",
+      "deloriginals",
+      "delfavorites",
+      "delbeverage",
+      "delsides",
+      "delcombos",
+      "dayoldbread",
+      "freshbread",
+      "desserts",
+      "boxlunch",
+      "catering",
+      "deliveryfee",
+      "other",
+      "modifiers",
+      "totalofabove",
+      "overrings",
+      "adjustedsales",
+      "netemployeefreebies",
+      "netmanagerfreebies",
+      "sampling",
+      "waste",
+      "otherpromo",
+      "loyaltycoupon",
+      "royaltysales",
+      "othertaxfee",
+      "salestax",
+      "overringstax",
+      "freebiepromotax",
+      "cashpayouts",
+      "ardue",
+      "arpaid",
+      "ardrivers",
+      "ardueccinshopvmcd",
+      "ardueccinshopamex",
+      "ardueccmotovmcd",
+      "ardueccmotoamex",
+      "arduecconlinevmcd",
+      "arduecconlineamex",
+      "otherpaymenttypes",
+      "doordash",
+      "grubhub",
+      "ubereats",
+      "giftcardsissued",
+      "giftcardsredeemed",
+      "nsfdeposit",
+      "expecteddeposit",
+      "totaldeposit",
+      "cashoverunder",
+      "ofsales",
+      "ofchecks",
+      "labor",
+      "labor~2",
+      "laborovertime",
+      "totalonlineorders",
+      "onlinecash",
+      "pdqmxsalescheck",
+      "pdqmxtaxcheck",
+      "giftcardstotal"
+    ],
+    "minCoverage": 0.6
+  },
+  "store": {
+    "metaKey": "Store #"
+  },
+  "columns": [
+    {
+      "name": "Net sales",
+      "add": [
+        "= Royalty Sales"
+      ]
+    },
+    {
+      "name": "Tax",
+      "add": [
+        "+ Sales Tax"
+      ]
+    },
+    {
+      "name": "Driver Drop",
+      "add": [
+        "+ A/R Drivers"
+      ]
+    },
+    {
+      "name": "Driver Bank",
+      "constant": 0
+    },
+    {
+      "name": "DMR",
+      "constant": 0
+    },
+    {
+      "name": "American Express",
+      "add": [
+        "- A/R Due CC (InShop) Amex",
+        "- A/R Due CC (ONLINE) Amex",
+        "- A/R Due CC (MOTO) Amex"
+      ]
+    },
+    {
+      "name": "Discover",
+      "constant": 0
+    },
+    {
+      "name": "Discover Tip",
+      "constant": 0
+    },
+    {
+      "name": "DoorDash",
+      "add": [
+        "- DoorDash"
+      ]
+    },
+    {
+      "name": "Gift Card",
+      "constant": 0
+    },
+    {
+      "name": "GrubHub",
+      "add": [
+        "- GrubHub"
+      ]
+    },
+    {
+      "name": "MasterCard",
+      "constant": 0
+    },
+    {
+      "name": "MasterCard Tip",
+      "constant": 0
+    },
+    {
+      "name": "UberEats",
+      "add": [
+        "- UberEats"
+      ]
+    },
+    {
+      "name": "VISA",
+      "add": [
+        "- A/R Due CC (InShop) V/MC/D",
+        "- A/R Due CC (ONLINE) V/MC/D",
+        "- A/R Due CC (MOTO) V/MC/D"
+      ]
+    },
+    {
+      "name": "VISA Tip",
+      "constant": 0
+    },
+    {
+      "name": "#1",
+      "add": [
+        "= Expected Deposit"
+      ]
+    },
+    {
+      "name": "#2",
+      "blank": true
+    },
+    {
+      "name": "#3",
+      "blank": true
+    },
+    {
+      "name": "#4",
+      "blank": true
+    },
+    {
+      "name": "#5",
+      "blank": true
+    },
+    {
+      "name": "P#1",
+      "blank": true
+    },
+    {
+      "name": "P#2",
+      "blank": true
+    },
+    {
+      "name": "Cash Shortage",
+      "constant": 0
+    }
+  ],
+  "learnedFrom": {
+    "dates": [
+      "08-05-2026",
+      "08-06-2026",
+      "08-07-2026",
+      "08-08-2026",
+      "08-09-2026",
+      "08-10-2026",
+      "08-11-2026"
+    ],
+    "sampleStore": "JJS001",
+    "createdAt": "2026-11-16T16:55:05.241Z"
+  }
+}

@@ -1,102 +1,19 @@
 import fs from "fs";
 import csv from "csv-parser";
 import XLSX from "xlsx";
-import moment from "moment";
+import {
+  cleanCell,
+  cleanObjectForSampleData,
+  exactKeyName,
+  isDateLike,
+  isEmptyCell,
+  normId,
+  normKey,
+} from "./cellClean.js";
 
-// ─── Row cleaning (shared with the data-update routes) ─────────────────────────
-
-const DATE_FORMATS = [
-  "MM-DD-YYYY",
-  "MM/DD/YYYY",
-  "YYYY-MM-DD",
-  "DD-MM-YYYY",
-  "DD/MM/YYYY",
-  "M/D/YYYY",
-  "MM-DD-YY",
-  "M-D-YYYY",
-  "M/D/YY",
-  "MM/DD/YY",
-  "M-D-YY",
-  "YYYY/MM/DD",
-  "YYYY-MM-DD HH:mm:ss",
-  "M/D/YYYY H:mm",
-  "M/D/YYYY h:mm A",
-  "MMM D, YYYY",
-  "MMMM D, YYYY",
-  "D-MMM-YY",
-  "D-MMM-YYYY",
-  "DD-MMM-YY",
-  "DD-MMM-YYYY",
-  "MMM DD, YYYY",
-  "MMM-DD-YYYY",
-  "YYYYMMDD",
-  "M.D.YYYY",
-  "MM.DD.YYYY",
-  "YYYY.MM.DD",
-  "D MMM YYYY",
-  "DD MMM YYYY",
-];
-
-export function cleanObjectForSampleData(obj) {
-  return Object.keys(obj).reduce((acc, key) => {
-    const cleanKey = key.trim().replace(/\s+/g, "").replace(/\./g, "_");
-    let value = obj[key];
-
-    if (typeof value === "string") {
-      value = value.trim().replace(/\x00/g, "");
-      if (cleanKey.toLowerCase() !== "date") {
-        const parsedNumber = parseFloat(value.replace(/[^0-9.-]/g, ""));
-        if (!isNaN(parsedNumber) && value.match(/^-?\d*\.?\d*$/)) {
-          value = Number(parsedNumber.toFixed(2));
-        }
-      }
-    } else if (typeof value === "number" && !isNaN(value)) {
-      value = Number(value.toFixed(2));
-    } else if (value === null || value === undefined) {
-      value = null;
-    }
-
-    if (cleanKey.toLowerCase() === "date") {
-      // "46083" (a CSV export of an Excel date) is a serial number, not text
-      if (typeof value === "string" && /^\d{5}(\.\d+)?$/.test(value)) {
-        value = Number(value);
-      }
-      if (
-        typeof value === "number" &&
-        Number.isInteger(value) &&
-        value >= 19000101 &&
-        value <= 20991231
-      ) {
-        // 20260901 style
-        const ymd = moment(String(value), "YYYYMMDD", true);
-        value = ymd.isValid() ? ymd.format("MM-DD-YYYY") : null;
-      } else if (typeof value === "number") {
-        const excelEpoch = new Date(Date.UTC(1899, 11, 31));
-        const utcDate = new Date(excelEpoch.getTime() + (value - 1) * 86400000);
-        value = moment.utc(utcDate).format("MM-DD-YYYY");
-      } else if (value) {
-        const parsedDate = moment(String(value), DATE_FORMATS, true);
-        if (parsedDate.isValid()) {
-          value = parsedDate.format("MM-DD-YYYY");
-        } else {
-          value = null;
-        }
-      }
-    }
-
-    acc[cleanKey] = value;
-    return acc;
-  }, {});
-}
+export { cleanObjectForSampleData, normId, normKey };
 
 // ─── Header recognition ────────────────────────────────────────────────────────
-
-const cleanKeyName = (key) => key.trim().replace(/\s+/g, "").replace(/\./g, "_");
-
-export const normKey = (s) =>
-  String(s ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
 
 // Priority order: an exact "storename"/"date" header always wins, aliases are
 // only used when the exact name is not present.
@@ -138,9 +55,21 @@ const STORE_ID_ALIASES = [
   "sitenumber",
   "siteid",
 ];
-const STORE_ID_SET = new Set(STORE_ID_ALIASES);
+export const STORE_ID_SET = new Set(STORE_ID_ALIASES);
 
 const HEADER_SCAN_ROWS = 30;
+const LOOKAHEAD_ROWS = 250; // rows read before the layout of a sheet is decided
+const DATE_HINT = /date|day|period|dt|time|business|when/;
+const METRIC_WORDS = /sales|tax|amount|total|count|tip|fee|price|cost|discount|refund|qty|quantity/;
+
+export const isBlankRow = (row) => {
+  if (!row) return true;
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    if (v !== null && v !== undefined && v !== "") return false;
+  }
+  return true;
+};
 
 function findAliasIndex(normalizedHeaders, aliases) {
   for (const alias of aliases) {
@@ -150,64 +79,18 @@ function findAliasIndex(normalizedHeaders, aliases) {
   return -1;
 }
 
-// "02384", "#2384", " 2384.0 " and 2384 are the same store id; text ids such as
-// "Burger Exp 1" are compared ignoring case and spacing.
-export function normId(value) {
-  let s = String(value ?? "")
-    .trim()
-    .toLowerCase()
-    .replace(/^#\s*/, "")
-    .replace(/\s+/g, " ");
-  if (/^\d+(\.0+)?$/.test(s)) s = s.replace(/\.0+$/, "").replace(/^0+(?=\d)/, "");
-  return s;
-}
-
 // Reports often have title rows above the real header, so look for the first
 // row that has a date column and some way of identifying the store.
 export function detectHeaderRow(rows) {
   const limit = Math.min(rows.length, HEADER_SCAN_ROWS);
   for (let r = 0; r < limit; r++) {
-    const normalized = (rows[r] || []).map(normKey);
+    const normalized = Array.from(rows[r] || [], normKey);
     const hasStore =
       findAliasIndex(normalized, STORE_ALIASES) !== -1 ||
       findAliasIndex(normalized, STORE_ID_ALIASES) !== -1;
     if (hasStore && findAliasIndex(normalized, DATE_ALIASES) !== -1) return r;
   }
   return -1;
-}
-
-// ── Content based detection ──────────────────────────────────────────────────
-// Column names cannot be trusted ("Date", "DATE", "Business Day", "Col A"...),
-// so what a column *contains* decides whether it is the date or the store.
-
-const SERIAL_MIN = 42005; // Excel serial for 2015-01-01
-const SERIAL_MAX = 49674; // ... 2035-12-31
-const DATE_HINT = /date|day|period|dt|time|business|when/;
-const METRIC_WORDS = /sales|tax|amount|total|count|tip|fee|price|cost|discount|refund|qty|quantity/;
-
-const isEmptyCell = (v) => v === null || v === undefined || String(v).trim() === "";
-
-function isDateLike(value, headerHint = false) {
-  if (isEmptyCell(value)) return false;
-  if (value instanceof Date) return !isNaN(value);
-  if (typeof value === "number") {
-    if (Number.isInteger(value)) {
-      if (value >= SERIAL_MIN && value <= SERIAL_MAX) return true;
-      return (
-        value >= 20150101 &&
-        value <= 20351231 &&
-        moment(String(value), "YYYYMMDD", true).isValid()
-      );
-    }
-    // a decimal (date with a time part) is only believed with a date-ish header
-    return headerHint && value >= SERIAL_MIN && value < SERIAL_MAX + 1;
-  }
-  const text = String(value).trim();
-  if (/^\d{5}(\.\d+)?$/.test(text)) {
-    const n = Number(text);
-    return headerHint && n >= SERIAL_MIN && n <= SERIAL_MAX;
-  }
-  return moment(text, DATE_FORMATS, true).isValid();
 }
 
 const columnSample = (dataRows, c, limit = 200) => {
@@ -250,7 +133,7 @@ export function detectHeaderRowByContent(rows) {
   const limit = Math.min(rows.length - 1, HEADER_SCAN_ROWS);
   for (let r = 0; r < limit; r++) {
     const cells = rows[r] || [];
-    const filled = cells.filter((v) => !isEmptyCell(v));
+    const filled = Array.from(cells).filter((v) => !isEmptyCell(v));
     if (filled.length < 2) continue;
     const textual = filled.filter(
       (v) => typeof v === "string" && isNaN(Number(v)) && !isDateLike(v),
@@ -276,6 +159,12 @@ export function detectHeaderRowByContent(rows) {
 // ids we know is treated as an id column, not a name. When no header names a
 // store at all, a header that merely starts with "store"/"location" is used, and
 // as a last resort the column whose values are known store ids or names.
+// A value counts as a known store id only if it looks like one: 3+ characters.
+const isKnownId = (value, idToName) => {
+  const id = normId(value);
+  return id.length >= 3 && idToName.has(id);
+};
+
 export function locateColumns(headerCells, dataRows = [], idToName = new Map()) {
   const normalized = headerCells.map(normKey);
   const dateIdx = findDateColumn(headerCells, dataRows);
@@ -285,7 +174,7 @@ export function locateColumns(headerCells, dataRows = [], idToName = new Map()) 
 
   if (exactNameIdx === -1 && nameIdx !== -1 && idToName.size > 0) {
     const sample = columnSample(dataRows, nameIdx, 50);
-    const known = sample.filter((v) => idToName.has(normId(v))).length;
+    const known = sample.filter((v) => isKnownId(v, idToName)).length;
     if (sample.length > 0 && known / sample.length >= 0.5 && idIdx === -1) {
       idIdx = nameIdx;
       nameIdx = -1;
@@ -305,30 +194,55 @@ export function locateColumns(headerCells, dataRows = [], idToName = new Map()) 
     }
   }
 
+  // No header names a store: look at what the columns contain. A column of
+  // known store NAMES wins; a column of known store IDS is only believed when
+  // nearly every value is one (a numeric measure such as 0-8 must never pass).
   if (nameIdx === -1 && idIdx === -1 && idToName.size > 0) {
     const knownNames = new Set([...idToName.values()].map((v) => String(v).trim().toLowerCase()));
-    let bestRatio = 0;
+    const best = { name: { c: -1, ratio: 0 }, id: { c: -1, ratio: 0 } };
     for (let c = 0; c < normalized.length; c++) {
       if (c === dateIdx) continue;
       const sample = columnSample(dataRows, c, 100);
       if (sample.length === 0) continue;
-      const idRatio = sample.filter((v) => idToName.has(normId(v))).length / sample.length;
       const nameRatio =
-        sample.filter((v) => knownNames.has(String(v).trim().toLowerCase())).length /
-        sample.length;
-      if (Math.max(idRatio, nameRatio) >= 0.6 && Math.max(idRatio, nameRatio) > bestRatio) {
-        bestRatio = Math.max(idRatio, nameRatio);
-        if (nameRatio >= idRatio) {
-          nameIdx = c;
-          idIdx = -1;
-        } else {
-          idIdx = c;
-          nameIdx = -1;
-        }
+        sample.filter((v) => knownNames.has(String(v).trim().toLowerCase())).length / sample.length;
+      const idRatio = sample.filter((v) => isKnownId(v, idToName)).length / sample.length;
+      if (nameRatio > best.name.ratio) best.name = { c, ratio: nameRatio };
+      if (idRatio > best.id.ratio) best.id = { c, ratio: idRatio };
+    }
+    if (best.name.ratio >= 0.6) nameIdx = best.name.c;
+    else if (best.id.ratio >= 0.9) idIdx = best.id.c;
+  }
+
+  // Last resort: nothing is named or recognisable as a store, but there is a
+  // date. The store is then the text column that is filled on (nearly) every
+  // row and has the most different values. The caller reports that this was a
+  // guess, so a wrong one is visible instead of silent.
+  let guessed = false;
+  if (nameIdx === -1 && idIdx === -1 && dateIdx !== -1) {
+    const rowsWithDate = columnSample(dataRows, dateIdx, 250).length;
+    let best = -1;
+    let bestDistinct = 0;
+    for (let c = 0; c < normalized.length; c++) {
+      if (c === dateIdx || rowsWithDate === 0) continue;
+      const sample = columnSample(dataRows, c, 250);
+      if (sample.length / rowsWithDate < 0.9) continue;
+      const texty = sample.filter(
+        (v) => typeof v === "string" && v.length <= 60 && isNaN(Number(v)) && !isDateLike(v),
+      ).length;
+      if (texty / sample.length < 0.9) continue;
+      const distinct = new Set(sample.map((v) => String(v).trim().toLowerCase())).size;
+      if (distinct > bestDistinct) {
+        best = c;
+        bestDistinct = distinct;
       }
     }
+    if (best !== -1) {
+      nameIdx = best;
+      guessed = true;
+    }
   }
-  return { nameIdx, idIdx, dateIdx };
+  return { nameIdx, idIdx, dateIdx, guessed };
 }
 
 // Maps every header cell to the column name it should be stored under:
@@ -336,14 +250,15 @@ export function locateColumns(headerCells, dataRows = [], idToName = new Map()) 
 //  - headers that match a column the collection already has (ignoring case,
 //    spaces and punctuation) reuse that column's name, so the same data never
 //    ends up split across "NetSales", "Net Sales" and "NETSALES"
-//  - anything else keeps its own name (new columns are never dropped), and a
-//    store-id column is kept as a normal column next to the resolved StoreName
+//  - anything else is stored exactly as written in the file (new columns are
+//    never dropped or renamed), and a store-id column is kept as a normal
+//    column next to the resolved StoreName
 export function buildColumnTargets(headerCells, knownColumns = new Map(), roles = null) {
-  const headers = headerCells.map((h) =>
+  const headers = Array.from(headerCells, (h) =>
     h === null || h === undefined ? "" : String(h).trim(),
   );
   const normalized = headers.map(normKey);
-  const { nameIdx, dateIdx } = roles ?? locateColumns(headerCells);
+  const { nameIdx, dateIdx } = roles ?? locateColumns(headers);
 
   const used = new Set();
   return headers.map((header, i) => {
@@ -353,8 +268,7 @@ export function buildColumnTargets(headerCells, knownColumns = new Map(), roles 
     else if (!header) target = i === 0 ? "__EMPTY" : `__EMPTY_${i}`;
     else {
       const known = knownColumns.get(normalized[i]);
-      // New columns follow the existing naming rule (no spaces, "." -> "_").
-      target = known && known !== "StoreName" && known !== "Date" ? known : cleanKeyName(header);
+      target = known && known !== "StoreName" && known !== "Date" ? known : exactKeyName(header);
     }
 
     let unique = target;
@@ -366,118 +280,210 @@ export function buildColumnTargets(headerCells, knownColumns = new Map(), roles 
 
 // ─── File reading ──────────────────────────────────────────────────────────────
 
-const isBlankRow = (row) =>
-  !row || row.every((c) => c === null || c === undefined || c === "");
+// Streams a CSV one row at a time (rows are arrays, empty cells are null) so a
+// huge file never has to fit in memory.
+export async function* csvRowStream(filePath) {
+  const stream = fs.createReadStream(filePath).pipe(csv({ headers: false }));
+  try {
+    for await (const row of stream) {
+      // csv-parser keys are "0","1","2"... - integer keys iterate in order
+      const values = Object.values(row);
+      for (let i = 0; i < values.length; i++) if (values[i] === "") values[i] = null;
+      yield values;
+    }
+  } finally {
+    stream.destroy();
+  }
+}
+
+const XLSX_READ_OPTIONS = {
+  dense: true, // arrays instead of one object per cell: far less memory/time
+  cellFormula: false,
+  cellHTML: false,
+  cellNF: false,
+  cellStyles: false,
+  sheetStubs: false,
+};
+
+export function readWorkbookSheets(filePath) {
+  const workbook = XLSX.readFile(filePath, XLSX_READ_OPTIONS);
+  return workbook.SheetNames.map((sheetName) => ({
+    sheetName,
+    rows: XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
+      header: 1,
+      defval: null,
+    }),
+  }));
+}
 
 export async function readUploadedFile(filePath, extension) {
-  if (extension === "csv") {
-    const rows = await new Promise((resolve, reject) => {
-      const out = [];
-      fs.createReadStream(filePath)
-        .pipe(csv({ headers: false }))
-        .on("data", (row) => {
-          const keys = Object.keys(row).sort((a, b) => Number(a) - Number(b));
-          out.push(keys.map((k) => (row[k] === "" ? null : row[k])));
-        })
-        .on("end", () => resolve(out))
-        .on("error", reject);
-    });
+  if (extension === "csv" || extension === "txt") {
+    const rows = [];
+    for await (const row of csvRowStream(filePath)) rows.push(row);
     return [{ sheetName: "csv", rows }];
   }
+  if (extension === "xlsx" || extension === "xls") return readWorkbookSheets(filePath);
+  throw new Error("Invalid file format");
+}
 
-  if (extension === "xlsx" || extension === "xls") {
-    const workbook = XLSX.readFile(filePath);
-    return workbook.SheetNames.map((sheetName) => ({
-      sheetName,
-      rows: XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-        header: 1,
-        defval: null,
-      }),
-    }));
+// ─── Turning rows into records ─────────────────────────────────────────────────
+
+export const newSkipped = () => ({ missingStoreName: 0, missingOrInvalidDate: 0, samples: [] });
+export const newStoreIds = () => ({ column: null, guessedColumn: null, resolved: 0, unresolved: new Set() });
+
+// Feeds on the rows of ONE sheet and produces cleaned records. The layout
+// (header row, date/store columns) is decided from the first rows, then every
+// further row is converted with the per-column information prepared once - so
+// the cost per row is a single pass over its cells. Records can be drained in
+// chunks while rows are still arriving, which keeps memory flat for huge files.
+export class SheetExtractor {
+  constructor(
+    sheetName,
+    {
+      knownColumns = new Map(),
+      idToName = new Map(),
+      skipped = newSkipped(),
+      storeIds = newStoreIds(),
+      detectedColumns = [],
+    } = {},
+  ) {
+    this.sheetName = sheetName;
+    this.known = knownColumns;
+    this.idToName = idToName;
+    this.skipped = skipped;
+    this.storeIds = storeIds;
+    this.detectedColumns = detectedColumns;
+    this.noHeader = false;
+    this.out = [];
+    this._buffer = [];
+    this._locked = false;
+    this._empty = false;
+    this._rowNo = 0;
   }
 
-  throw new Error("Invalid file format");
+  push(row) {
+    this._rowNo++;
+    if (!this._locked) {
+      this._buffer.push(row);
+      if (this._buffer.length >= LOOKAHEAD_ROWS) this._lock();
+      return;
+    }
+    this._process(row, this._rowNo);
+  }
+
+  finish() {
+    if (!this._locked) this._lock();
+  }
+
+  drain() {
+    const out = this.out;
+    this.out = [];
+    return out;
+  }
+
+  _lock() {
+    this._locked = true;
+    const rows = this._buffer;
+    this._buffer = [];
+
+    let headerRow = detectHeaderRow(rows);
+    if (headerRow === -1) headerRow = detectHeaderRowByContent(rows);
+    if (headerRow === -1) {
+      this.noHeader = true;
+      headerRow = rows.findIndex((r) => !isBlankRow(r));
+      if (headerRow === -1) {
+        this._empty = true;
+        return;
+      }
+    }
+
+    const headerCells = Array.from(rows[headerRow]);
+    this.roles = locateColumns(headerCells, rows.slice(headerRow + 1), this.idToName);
+    this.targets = buildColumnTargets(headerCells, this.known, this.roles);
+    if (this.detectedColumns.length === 0) this.detectedColumns.push(...this.targets);
+    this.isDate = this.targets.map((_, c) => c === this.roles.dateIdx);
+    if (this.roles.guessed) {
+      this.guessedStoreColumn = String(headerCells[this.roles.nameIdx] ?? "").trim();
+      if (!this.storeIds.guessedColumn) this.storeIds.guessedColumn = this.guessedStoreColumn;
+    }
+    this.dateMemo = new Map();
+
+    // No store name column: the name is looked up from the store id column.
+    this.idTarget =
+      this.roles.nameIdx === -1 && this.roles.idIdx !== -1 ? this.targets[this.roles.idIdx] : null;
+    if (this.idTarget && !this.storeIds.column) this.storeIds.column = this.idTarget;
+
+    for (let i = headerRow + 1; i < rows.length; i++) this._process(rows[i], i + 1);
+  }
+
+  _process(row, rowNo) {
+    if (this._empty || isBlankRow(row)) return;
+    const targets = this.targets;
+    const isDate = this.isDate;
+    const memo = this.dateMemo;
+
+    let record = {};
+    for (let c = 0; c < row.length; c++) {
+      const v = row[c];
+      record[targets[c] ?? `__EMPTY_${c}`] = cleanCell(
+        v === undefined ? null : v,
+        isDate[c] === true,
+        memo,
+      );
+    }
+
+    if (this.idTarget) {
+      const idValue = record[this.idTarget];
+      if (!isEmptyCell(idValue)) {
+        const name = this.idToName.get(normId(idValue));
+        if (name) this.storeIds.resolved++;
+        else this.storeIds.unresolved.add(String(idValue).trim());
+        record = { StoreName: name ?? String(idValue).trim(), ...record };
+      }
+    }
+
+    const hasStore = !isEmptyCell(record.StoreName);
+    const hasDate = Boolean(record.Date);
+    if (hasStore && hasDate) {
+      this.out.push(record);
+      return;
+    }
+
+    if (!hasStore) this.skipped.missingStoreName++;
+    else this.skipped.missingOrInvalidDate++;
+    if (this.skipped.samples.length < 5) {
+      this.skipped.samples.push({
+        sheet: this.sheetName,
+        row: rowNo,
+        reason: !hasStore ? "missing StoreName / store id" : "missing or invalid Date",
+      });
+    }
+  }
 }
 
 // Turns the raw rows of every sheet into cleaned records and reports exactly
 // why any row was left out (instead of silently dropping it).
 export function extractRecords(sheets, knownColumns = new Map(), idToName = new Map()) {
   const records = [];
-  const skipped = { missingStoreName: 0, missingOrInvalidDate: 0, samples: [] };
+  const skipped = newSkipped();
   const detectedColumns = [];
   const sheetsWithoutHeader = [];
-  const storeIds = { column: null, resolved: 0, unresolved: new Set() };
+  const storeIds = newStoreIds();
 
   for (const { sheetName, rows } of sheets) {
     if (!rows || rows.length === 0) continue;
-
-    let headerRow = detectHeaderRow(rows);
-    if (headerRow === -1) headerRow = detectHeaderRowByContent(rows);
-    if (headerRow === -1) {
-      sheetsWithoutHeader.push(sheetName);
-      headerRow = rows.findIndex((r) => !isBlankRow(r));
-      if (headerRow === -1) continue;
-    }
-
-    const roles = locateColumns(rows[headerRow], rows.slice(headerRow + 1), idToName);
-    const targets = buildColumnTargets(rows[headerRow], knownColumns, roles);
-    if (detectedColumns.length === 0) detectedColumns.push(...targets);
-    // No store name column: the name is looked up from the store id column.
-    const idTarget = roles.nameIdx === -1 && roles.idIdx !== -1 ? targets[roles.idIdx] : null;
-    if (idTarget && !storeIds.column) storeIds.column = idTarget;
-
-    // cleanObjectForSampleData strips spaces from keys, which would split
-    // "Transaction Count" (already stored) from "TransactionCount". Clean the
-    // values under space-free keys, then restore the exact target names.
-    const cleanKeys = [];
-    const restore = new Map();
-    for (const target of targets) {
-      let key = cleanKeyName(target);
-      for (let n = 2; restore.has(key); n++) key = `${cleanKeyName(target)}_${n}`;
-      restore.set(key, target);
-      cleanKeys.push(key);
-    }
-
-    for (let r = headerRow + 1; r < rows.length; r++) {
-      const row = rows[r];
-      if (isBlankRow(row)) continue;
-
-      const raw = {};
-      for (let c = 0; c < row.length; c++) {
-        const key = cleanKeys[c] ?? `__EMPTY_${c}`;
-        raw[key] = row[c] === undefined ? null : row[c];
-      }
-      const cleaned = cleanObjectForSampleData(raw);
-      let record = {};
-      for (const [key, value] of Object.entries(cleaned)) {
-        record[restore.get(key) ?? key] = value;
-      }
-
-      if (idTarget && !isEmptyValue(record[idTarget])) {
-        const idValue = record[idTarget];
-        const name = idToName.get(normId(idValue));
-        if (name) storeIds.resolved++;
-        else storeIds.unresolved.add(String(idValue).trim());
-        record = { StoreName: name ?? String(idValue).trim(), ...record };
-      }
-
-      const hasStore = !isEmptyValue(record.StoreName) && String(record.StoreName).trim() !== "";
-      const hasDate = Boolean(record.Date);
-
-      if (hasStore && hasDate) {
-        records.push(record);
-        continue;
-      }
-      if (!hasStore) skipped.missingStoreName++;
-      else skipped.missingOrInvalidDate++;
-      if (skipped.samples.length < 5) {
-        skipped.samples.push({
-          sheet: sheetName,
-          row: r + 1,
-          reason: !hasStore ? "missing StoreName / store id" : "missing or invalid Date",
-        });
-      }
-    }
+    const extractor = new SheetExtractor(sheetName, {
+      knownColumns,
+      idToName,
+      skipped,
+      storeIds,
+      detectedColumns,
+    });
+    for (let i = 0; i < rows.length; i++) extractor.push(rows[i]);
+    extractor.finish();
+    if (extractor.noHeader) sheetsWithoutHeader.push(sheetName);
+    const out = extractor.drain();
+    for (let i = 0; i < out.length; i++) records.push(out[i]);
   }
 
   return { records, skipped, detectedColumns, sheetsWithoutHeader, storeIds };
@@ -490,10 +496,21 @@ export const recordKey = (record) =>
 
 const isEmptyValue = (v) => v === null || v === undefined || v === "";
 
+const idFieldCache = new Map();
+const isIdField = (key) => {
+  let hit = idFieldCache.get(key);
+  if (hit === undefined) {
+    hit = STORE_ID_SET.has(normKey(key));
+    idFieldCache.set(key, hit);
+  }
+  return hit;
+};
+
 // The store id a record carries (if it has a StoreNumber / StoreNo / ... column).
 export function storeIdOf(record) {
-  for (const [key, value] of Object.entries(record)) {
-    if (STORE_ID_SET.has(normKey(key)) && !isEmptyValue(value)) return normId(value);
+  for (const key in record) {
+    const value = record[key];
+    if (!isEmptyValue(value) && isIdField(key)) return normId(value);
   }
   return null;
 }
@@ -510,7 +527,8 @@ const identityKeys = (record) => {
 // value that is already stored).
 function missingFields(existing, incoming) {
   const out = {};
-  for (const [field, value] of Object.entries(incoming)) {
+  for (const field in incoming) {
+    const value = incoming[field];
     if (field === "_id" || isEmptyValue(value)) continue;
     if (isEmptyValue(existing[field])) out[field] = value;
   }
@@ -547,7 +565,7 @@ export async function loadStoreIdMap(collection, storeDataCollection, sampleSize
     // about the real name, so they must not shadow StoreData.
     if (id && normId(doc.StoreName) === id) continue;
     if (id) add(id, doc.StoreName);
-    for (const group of String(doc.StoreName).match(/\d{3,}/g) || []) add(group, doc.StoreName);
+    for (const group of String(doc.StoreName).match(/\d{4,}/g) || []) add(group, doc.StoreName);
   }
 
   if (storeDataCollection) {
@@ -559,18 +577,35 @@ export async function loadStoreIdMap(collection, storeDataCollection, sampleSize
   return map;
 }
 
-export async function storeRecords(collection, records, { dateChunk = 100 } = {}) {
+async function mapLimit(items, limit, fn) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// Stores one batch of records. Call it once per chunk of a large upload: each
+// call only loads the already-stored rows that could clash with this batch.
+export async function storeRecords(collection, records, { dateChunk = 100, concurrency = 4 } = {}) {
   const result = { inserted: 0, duplicates: 0, updated: 0, errors: [] };
 
-  // 1. Collapse duplicates inside the upload itself; a later copy can still
+  // 1. Collapse duplicates inside the batch; a later copy can still
   //    contribute fields the first copy lacked.
   const seen = new Map();
   const unique = [];
   for (const record of records) {
     const keys = identityKeys(record);
-    const first = keys.map((k) => seen.get(k)).find(Boolean);
+    let first;
+    for (const k of keys) {
+      first = seen.get(k);
+      if (first) break;
+    }
     if (!first) {
-      keys.forEach((k) => seen.set(k, record));
+      for (const k of keys) seen.set(k, record);
       unique.push(record);
       continue;
     }
@@ -585,12 +620,30 @@ export async function storeRecords(collection, records, { dateChunk = 100 } = {}
     byDate.get(record.Date).push(record);
   }
   const dates = [...byDate.keys()];
+  const dateGroups = [];
+  for (let i = 0; i < dates.length; i += dateChunk) dateGroups.push(dates.slice(i, i + dateChunk));
 
-  for (let i = 0; i < dates.length; i += dateChunk) {
-    const chunkDates = dates.slice(i, i + dateChunk);
+  await mapLimit(dateGroups, concurrency, async (chunkDates) => {
     try {
+      const batch = chunkDates.flatMap((d) => byDate.get(d));
+
+      // Only fetch stored rows that can clash with this batch (same date AND
+      // same store name or store id) instead of every row of those dates.
+      const names = new Set();
+      const idsByField = new Map();
+      for (const record of batch) {
+        names.add(record.StoreName);
+        for (const key in record) {
+          if (!isIdField(key) || isEmptyValue(record[key])) continue;
+          if (!idsByField.has(key)) idsByField.set(key, new Set());
+          idsByField.get(key).add(record[key]);
+        }
+      }
+      const or = [{ StoreName: { $in: [...names] } }];
+      for (const [field, values] of idsByField) or.push({ [field]: { $in: [...values] } });
+
       const existingDocs = await collection
-        .find({ Date: { $in: chunkDates } })
+        .find({ Date: { $in: chunkDates }, $or: or })
         .toArray();
       const existingByKey = new Map();
       for (const doc of existingDocs) {
@@ -602,32 +655,29 @@ export async function storeRecords(collection, records, { dateChunk = 100 } = {}
 
       const toInsert = [];
       const updates = [];
-      for (const date of chunkDates) {
-        for (const record of byDate.get(date)) {
-          const existing = identityKeys(record)
-            .map((k) => existingByKey.get(k))
-            .find(Boolean);
-          if (!existing) {
-            toInsert.push(record);
-            continue;
-          }
-          result.duplicates++;
-          const fields = missingFields(existing, record);
-          // A row stored earlier under its raw id (name was unknown then) gets
-          // the proper store name once it can be resolved.
-          const id = storeIdOf(record);
-          if (
-            id &&
-            record.StoreName !== existing.StoreName &&
-            normId(existing.StoreName) === id
-          ) {
-            fields.StoreName = record.StoreName;
-          }
-          if (Object.keys(fields).length > 0) {
-            updates.push({
-              updateOne: { filter: { _id: existing._id }, update: { $set: fields } },
-            });
-          }
+      for (const record of batch) {
+        let existing;
+        for (const k of identityKeys(record)) {
+          existing = existingByKey.get(k);
+          if (existing) break;
+        }
+        if (!existing) {
+          toInsert.push(record);
+          continue;
+        }
+        result.duplicates++;
+        const fields = missingFields(existing, record);
+        // A row stored earlier under its raw id (name was unknown then) gets
+        // the proper store name once it can be resolved.
+        const id = storeIdOf(record);
+        if (id && record.StoreName !== existing.StoreName && normId(existing.StoreName) === id) {
+          fields.StoreName = record.StoreName;
+        }
+        for (const _ in fields) {
+          updates.push({
+            updateOne: { filter: { _id: existing._id }, update: { $set: fields } },
+          });
+          break;
         }
       }
 
@@ -649,7 +699,7 @@ export async function storeRecords(collection, records, { dateChunk = 100 } = {}
     } catch (err) {
       result.errors.push(err.message);
     }
-  }
+  });
 
   return result;
 }
